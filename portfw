@@ -84,13 +84,18 @@ protocols_for() {
 }
 
 detect_primary_ipv4() {
-  local ipaddr
-  ipaddr="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i=="src") {print $(i+1); exit}}')"
-  if ! validate_ipv4 "${ipaddr:-}"; then
-    echo "ERROR: could not detect the primary IPv4 source address from the default route." >&2
-    return 1
-  fi
-  printf '%s\n' "$ipaddr"
+  local ipaddr attempt
+  for attempt in {1..10}; do
+    ipaddr="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i=="src") {print $(i+1); exit}}')"
+    if validate_ipv4 "${ipaddr:-}"; then
+      printf '%s\n' "$ipaddr"
+      return 0
+    fi
+    sleep 1
+  done
+
+  echo "ERROR: could not detect the primary IPv4 source address from the default route." >&2
+  return 1
 }
 
 validate_state_file() {
@@ -158,6 +163,7 @@ apply_rules() {
 
       iptables -w 5 -t nat -A "$SNAT_CHAIN" \
         -d "${dest_ip}/32" -p "$proto" --dport "$dest_port" \
+        -m conntrack --ctstate DNAT --ctorigdstport "$source_port" \
         -j SNAT --to-source "$primary_ip"
     done
   done < "$RULES_FILE"
@@ -394,7 +400,9 @@ delete_all_rules() {
 }
 
 print_header() {
-  clear
+  if command -v clear >/dev/null 2>&1; then
+    clear
+  fi
   echo -e "${CYAN}${BOLD}iptables Forward Manager${NC}"
   echo "Persistent port forwarding without exposing raw iptables rules."
   echo

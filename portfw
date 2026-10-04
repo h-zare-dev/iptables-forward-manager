@@ -1,0 +1,458 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+APP_NAME="iptables-forward-manager"
+STATE_DIR="/etc/${APP_NAME}"
+RULES_FILE="${STATE_DIR}/rules.db"
+LOCK_FILE="/run/${APP_NAME}.lock"
+SYSCTL_FILE="/etc/sysctl.d/99-${APP_NAME}.conf"
+
+DNAT_CHAIN="IFM_DNAT"
+SNAT_CHAIN="IFM_SNAT"
+FORWARD_CHAIN="IFM_FORWARD"
+
+GREEN='\033[0;32m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+require_root() {
+  if [[ ${EUID} -ne 0 ]]; then
+    echo "ERROR: run this command as root (or with sudo)." >&2
+    exit 1
+  fi
+}
+
+require_commands() {
+  local cmd
+  for cmd in ip iptables awk mktemp flock install sysctl; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      echo "ERROR: required command not found: $cmd" >&2
+      exit 1
+    fi
+  done
+}
+
+ensure_storage() {
+  install -d -m 0700 "$STATE_DIR"
+  if [[ ! -e "$RULES_FILE" ]]; then
+    install -m 0600 /dev/null "$RULES_FILE"
+  else
+    chmod 0600 "$RULES_FILE"
+  fi
+}
+
+acquire_lock() {
+  exec 9>"$LOCK_FILE"
+  if ! flock -n 9; then
+    echo "ERROR: another ${APP_NAME} operation is already running." >&2
+    exit 1
+  fi
+}
+
+validate_ipv4() {
+  local ip="$1" octet
+  local -a octets
+  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  IFS='.' read -r -a octets <<< "$ip"
+  for octet in "${octets[@]}"; do
+    (( 10#$octet >= 0 && 10#$octet <= 255 )) || return 1
+  done
+}
+
+validate_port() {
+  [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 ))
+}
+
+normalize_protocol() {
+  local value="${1,,}"
+  case "$value" in
+    tcp) echo "tcp" ;;
+    udp) echo "udp" ;;
+    both|tcp+udp|all|"") echo "both" ;;
+    *) return 1 ;;
+  esac
+}
+
+protocols_for() {
+  case "$1" in
+    tcp) echo "tcp" ;;
+    udp) echo "udp" ;;
+    both) echo "tcp udp" ;;
+    *) return 1 ;;
+  esac
+}
+
+detect_primary_ipv4() {
+  local ipaddr
+  ipaddr="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i=="src") {print $(i+1); exit}}')"
+  if ! validate_ipv4 "${ipaddr:-}"; then
+    echo "ERROR: could not detect the primary IPv4 source address from the default route." >&2
+    return 1
+  fi
+  printf '%s\n' "$ipaddr"
+}
+
+validate_state_file() {
+  local id source_port dest_ip dest_port protocol
+  while IFS='|' read -r id source_port dest_ip dest_port protocol; do
+    [[ -n "${id:-}" ]] || continue
+    [[ "$id" =~ ^[0-9]+$ ]] || { echo "ERROR: invalid rule ID in state: $id" >&2; return 1; }
+    validate_port "$source_port" || { echo "ERROR: invalid source port in state: $source_port" >&2; return 1; }
+    validate_ipv4 "$dest_ip" || { echo "ERROR: invalid destination IP in state: $dest_ip" >&2; return 1; }
+    validate_port "$dest_port" || { echo "ERROR: invalid destination port in state: $dest_port" >&2; return 1; }
+    normalize_protocol "$protocol" >/dev/null || { echo "ERROR: invalid protocol in state for rule $id" >&2; return 1; }
+  done < "$RULES_FILE"
+}
+
+ensure_chain() {
+  local table="$1" chain="$2"
+  iptables -w 5 -t "$table" -N "$chain" 2>/dev/null || true
+  iptables -w 5 -t "$table" -F "$chain"
+}
+
+ensure_single_jump() {
+  local table="$1" parent="$2" child="$3"
+  while iptables -w 5 -t "$table" -C "$parent" -j "$child" 2>/dev/null; do
+    iptables -w 5 -t "$table" -D "$parent" -j "$child"
+  done
+  iptables -w 5 -t "$table" -I "$parent" 1 -j "$child"
+}
+
+apply_rules() {
+  ensure_storage
+  validate_state_file
+
+  local primary_ip
+  primary_ip="$(detect_primary_ipv4)"
+
+  sysctl -w net.ipv4.ip_forward=1 >/dev/null
+  printf 'net.ipv4.ip_forward=1\n' > "$SYSCTL_FILE"
+  chmod 0644 "$SYSCTL_FILE"
+
+  ensure_chain nat "$DNAT_CHAIN"
+  ensure_chain nat "$SNAT_CHAIN"
+  ensure_chain filter "$FORWARD_CHAIN"
+
+  ensure_single_jump nat PREROUTING "$DNAT_CHAIN"
+  ensure_single_jump nat POSTROUTING "$SNAT_CHAIN"
+  ensure_single_jump filter FORWARD "$FORWARD_CHAIN"
+
+  iptables -w 5 -t filter -A "$FORWARD_CHAIN" \
+    -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+
+  local id source_port dest_ip dest_port protocol proto
+  while IFS='|' read -r id source_port dest_ip dest_port protocol; do
+    [[ -n "${id:-}" ]] || continue
+
+    protocol="$(normalize_protocol "$protocol")"
+
+    for proto in $(protocols_for "$protocol"); do
+      iptables -w 5 -t nat -A "$DNAT_CHAIN" \
+        -p "$proto" --dport "$source_port" \
+        -j DNAT --to-destination "${dest_ip}:${dest_port}"
+
+      iptables -w 5 -t filter -A "$FORWARD_CHAIN" \
+        -d "${dest_ip}/32" -p "$proto" --dport "$dest_port" \
+        -j ACCEPT
+
+      iptables -w 5 -t nat -A "$SNAT_CHAIN" \
+        -d "${dest_ip}/32" -p "$proto" --dport "$dest_port" \
+        -j SNAT --to-source "$primary_ip"
+    done
+  done < "$RULES_FILE"
+}
+
+next_id() {
+  awk -F'|' 'BEGIN{max=0} $1 ~ /^[0-9]+$/ && $1>max {max=$1} END{print max+1}' "$RULES_FILE"
+}
+
+rule_exists() {
+  local id="$1"
+  awk -F'|' -v id="$id" '$1==id {found=1} END{exit !found}' "$RULES_FILE"
+}
+
+get_rule() {
+  local id="$1"
+  awk -F'|' -v id="$id" '$1==id {print; exit}' "$RULES_FILE"
+}
+
+protocols_overlap() {
+  local a="$1" b="$2"
+  [[ "$a" == "both" || "$b" == "both" || "$a" == "$b" ]]
+}
+
+has_source_conflict() {
+  local source_port="$1" protocol="$2" exclude_id="${3:-}"
+  local id existing_port _dest_ip _dest_port existing_protocol
+
+  while IFS='|' read -r id existing_port _dest_ip _dest_port existing_protocol; do
+    [[ -n "${id:-}" ]] || continue
+    [[ "$id" != "$exclude_id" ]] || continue
+    if [[ "$existing_port" == "$source_port" ]] && protocols_overlap "$protocol" "$existing_protocol"; then
+      return 0
+    fi
+  done < "$RULES_FILE"
+  return 1
+}
+
+list_rules() {
+  ensure_storage
+  echo
+  printf '%-4s %-12s %-17s %-16s %-9s\n' "ID" "Source Port" "Destination IP" "Destination Port" "Protocol"
+  printf '%-4s %-12s %-17s %-16s %-9s\n' "----" "------------" "-----------------" "----------------" "---------"
+
+  local count=0 id source_port dest_ip dest_port protocol display_protocol
+  while IFS='|' read -r id source_port dest_ip dest_port protocol; do
+    [[ -n "${id:-}" ]] || continue
+    case "$protocol" in
+      both) display_protocol="TCP+UDP" ;;
+      tcp) display_protocol="TCP" ;;
+      udp) display_protocol="UDP" ;;
+      *) display_protocol="$protocol" ;;
+    esac
+    printf '%-4s %-12s %-17s %-16s %-9s\n' "$id" "$source_port" "$dest_ip" "$dest_port" "$display_protocol"
+    ((count+=1))
+  done < "$RULES_FILE"
+
+  if (( count == 0 )); then
+    echo "No forwarding rules configured."
+  fi
+  echo
+}
+
+prompt_port() {
+  local label="$1" default="${2:-}" value
+  while true; do
+    if [[ -n "$default" ]]; then
+      read -r -p "$label [$default]: " value
+      value="${value:-$default}"
+    else
+      read -r -p "$label: " value
+    fi
+    if validate_port "$value"; then
+      printf '%s\n' "$value"
+      return
+    fi
+    echo "Invalid port. Enter a number from 1 to 65535." >&2
+  done
+}
+
+prompt_ipv4() {
+  local label="$1" default="${2:-}" value
+  while true; do
+    if [[ -n "$default" ]]; then
+      read -r -p "$label [$default]: " value
+      value="${value:-$default}"
+    else
+      read -r -p "$label: " value
+    fi
+    if validate_ipv4 "$value"; then
+      printf '%s\n' "$value"
+      return
+    fi
+    echo "Invalid IPv4 address." >&2
+  done
+}
+
+prompt_protocol() {
+  local default="${1:-both}" value normalized
+  while true; do
+    read -r -p "Protocol (tcp/udp/both) [$default]: " value
+    value="${value:-$default}"
+    if normalized="$(normalize_protocol "$value")"; then
+      printf '%s\n' "$normalized"
+      return
+    fi
+    echo "Invalid protocol. Use tcp, udp, or both." >&2
+  done
+}
+
+with_state_transaction() {
+  local backup
+  backup="$(mktemp)"
+  cp "$RULES_FILE" "$backup"
+
+  if "$@" && apply_rules; then
+    rm -f "$backup"
+    return 0
+  fi
+
+  echo "ERROR: applying the change failed; restoring the previous configuration." >&2
+  cp "$backup" "$RULES_FILE"
+  rm -f "$backup"
+  apply_rules || true
+  return 1
+}
+
+append_rule_record() {
+  printf '%s|%s|%s|%s|%s\n' "$1" "$2" "$3" "$4" "$5" >> "$RULES_FILE"
+}
+
+replace_rule_record() {
+  local target_id="$1" source_port="$2" dest_ip="$3" dest_port="$4" protocol="$5" tmp
+  tmp="$(mktemp)"
+  awk -F'|' -v OFS='|' \
+    -v id="$target_id" -v sp="$source_port" -v dip="$dest_ip" -v dp="$dest_port" -v proto="$protocol" \
+    '$1==id {$2=sp; $3=dip; $4=dp; $5=proto} {print}' "$RULES_FILE" > "$tmp"
+  install -m 0600 "$tmp" "$RULES_FILE"
+  rm -f "$tmp"
+}
+
+delete_rule_record() {
+  local target_id="$1" tmp
+  tmp="$(mktemp)"
+  awk -F'|' -v id="$target_id" '$1!=id' "$RULES_FILE" > "$tmp"
+  install -m 0600 "$tmp" "$RULES_FILE"
+  rm -f "$tmp"
+}
+
+clear_rule_records() {
+  : > "$RULES_FILE"
+  chmod 0600 "$RULES_FILE"
+}
+
+add_rule() {
+  echo
+  echo -e "${BOLD}Add Forwarding${NC}"
+
+  local source_port dest_ip dest_port protocol id
+  source_port="$(prompt_port "Source port")"
+  dest_ip="$(prompt_ipv4 "Destination IP")"
+  dest_port="$(prompt_port "Destination port")"
+  protocol="$(prompt_protocol "both")"
+
+  if has_source_conflict "$source_port" "$protocol"; then
+    echo "ERROR: source port $source_port already conflicts with an existing $protocol rule." >&2
+    return 1
+  fi
+
+  id="$(next_id)"
+  if with_state_transaction append_rule_record "$id" "$source_port" "$dest_ip" "$dest_port" "$protocol"; then
+    echo -e "${GREEN}Rule $id added successfully.${NC}"
+  fi
+}
+
+edit_rule() {
+  list_rules
+  local id record source_port dest_ip dest_port protocol
+  read -r -p "Select rule ID to edit: " id
+  if ! rule_exists "$id"; then
+    echo "Rule not found." >&2
+    return 1
+  fi
+
+  record="$(get_rule "$id")"
+  IFS='|' read -r _ source_port dest_ip dest_port protocol <<< "$record"
+
+  echo
+  echo -e "${BOLD}Edit Rule $id${NC}"
+  echo "Press Enter to keep the current value."
+
+  local new_source_port new_dest_ip new_dest_port new_protocol
+  new_source_port="$(prompt_port "Source port" "$source_port")"
+  new_dest_ip="$(prompt_ipv4 "Destination IP" "$dest_ip")"
+  new_dest_port="$(prompt_port "Destination port" "$dest_port")"
+  new_protocol="$(prompt_protocol "$protocol")"
+
+  if has_source_conflict "$new_source_port" "$new_protocol" "$id"; then
+    echo "ERROR: source port $new_source_port conflicts with another managed rule." >&2
+    return 1
+  fi
+
+  if with_state_transaction replace_rule_record "$id" "$new_source_port" "$new_dest_ip" "$new_dest_port" "$new_protocol"; then
+    echo -e "${GREEN}Rule $id updated successfully.${NC}"
+  fi
+}
+
+delete_rule() {
+  list_rules
+  local id answer
+  read -r -p "Select rule ID to delete: " id
+  if ! rule_exists "$id"; then
+    echo "Rule not found." >&2
+    return 1
+  fi
+
+  read -r -p "Delete rule $id? [y/N]: " answer
+  [[ "$answer" =~ ^[Yy]$ ]] || { echo "Cancelled."; return 0; }
+
+  if with_state_transaction delete_rule_record "$id"; then
+    echo -e "${GREEN}Rule $id deleted successfully.${NC}"
+  fi
+}
+
+delete_all_rules() {
+  list_rules
+  local answer
+  read -r -p "Delete ALL managed forwarding rules? [y/N]: " answer
+  [[ "$answer" =~ ^[Yy]$ ]] || { echo "Cancelled."; return 0; }
+
+  if with_state_transaction clear_rule_records; then
+    echo -e "${GREEN}All managed forwarding rules were deleted.${NC}"
+  fi
+}
+
+print_header() {
+  clear
+  echo -e "${CYAN}${BOLD}iptables Forward Manager${NC}"
+  echo "Persistent port forwarding without exposing raw iptables rules."
+  echo
+}
+
+pause() {
+  echo
+  read -r -p "Press Enter to continue..." _
+}
+
+interactive_menu() {
+  while true; do
+    print_header
+    echo "[1] Add Forwarding"
+    echo "[2] Edit Forwarding"
+    echo "[3] Delete Forwarding"
+    echo "[4] List Forwarding"
+    echo "[5] Delete All"
+    echo "[0] Exit"
+    echo
+
+    local choice
+    read -r -p "Select option: " choice
+    case "$choice" in
+      1) add_rule || true; pause ;;
+      2) edit_rule || true; pause ;;
+      3) delete_rule || true; pause ;;
+      4) list_rules || true; pause ;;
+      5) delete_all_rules || true; pause ;;
+      0) exit 0 ;;
+      *) echo "Invalid option."; sleep 1 ;;
+    esac
+  done
+}
+
+print_help() {
+  cat <<'HELP_EOF'
+Usage:
+  portfw              Open the interactive manager
+  portfw --apply      Rebuild managed iptables rules from saved state
+  portfw --list       List saved forwarding rules
+  portfw --help       Show this help
+HELP_EOF
+}
+
+main() {
+  require_root
+  require_commands
+  ensure_storage
+  acquire_lock
+
+  case "${1:-}" in
+    "") interactive_menu ;;
+    --apply) apply_rules ;;
+    --list) list_rules ;;
+    --help|-h) print_help ;;
+    *) print_help >&2; exit 2 ;;
+  esac
+}
+
+main "$@"

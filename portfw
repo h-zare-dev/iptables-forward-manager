@@ -98,6 +98,28 @@ detect_primary_ipv4() {
   return 1
 }
 
+detect_default_interface() {
+  ip -4 route show default 2>/dev/null | awk 'NR==1 {for (i=1; i<=NF; i++) if ($i=="dev") {print $(i+1); exit}}'
+}
+
+list_interface_ipv4() {
+  local interface="$1"
+  [[ -n "$interface" ]] || return 0
+  ip -4 -o addr show dev "$interface" scope global 2>/dev/null |
+    awk '{split($4,a,"/"); print a[1]}'
+}
+
+list_interface_ipv6() {
+  local interface="$1"
+  [[ -n "$interface" ]] || return 0
+  ip -6 -o addr show dev "$interface" scope global 2>/dev/null |
+    awk '{split($4,a,"/"); print a[1]}'
+}
+
+managed_rule_count() {
+  awk -F'|' '$1 ~ /^[0-9]+$/ {count++} END {print count+0}' "$RULES_FILE"
+}
+
 validate_state_file() {
   local id source_port dest_ip dest_port protocol
   while IFS='|' read -r id source_port dest_ip dest_port protocol; do
@@ -399,12 +421,51 @@ delete_all_rules() {
   fi
 }
 
+print_server_info() {
+  local hostname_value interface primary_ip rule_count
+  local ipv4_line ipv6_line ipaddr
+
+  hostname_value="$(hostname 2>/dev/null || echo unknown)"
+  interface="$(detect_default_interface)"
+  primary_ip="$(detect_primary_ipv4 2>/dev/null || true)"
+  rule_count="$(managed_rule_count)"
+
+  ipv4_line=""
+  while IFS= read -r ipaddr; do
+    [[ -n "$ipaddr" ]] || continue
+    [[ "$ipaddr" == "$primary_ip" ]] && continue
+    if [[ -n "$ipv4_line" ]]; then
+      ipv4_line+=", "
+    fi
+    ipv4_line+="$ipaddr"
+  done < <(list_interface_ipv4 "$interface")
+
+  ipv6_line=""
+  while IFS= read -r ipaddr; do
+    [[ -n "$ipaddr" ]] || continue
+    if [[ -n "$ipv6_line" ]]; then
+      ipv6_line+=", "
+    fi
+    ipv6_line+="$ipaddr"
+  done < <(list_interface_ipv6 "$interface")
+
+  echo "┌──────────────────────────────────────────────────────────────┐"
+  printf '│ Host: %-22s Interface: %-20s │\n' "$hostname_value" "${interface:-N/A}"
+  printf '│ Primary IPv4: %-46s │\n' "${primary_ip:-N/A}"
+  printf '│ Other IPv4:   %-46s │\n' "${ipv4_line:-None}"
+  printf '│ IPv6:         %-46s │\n' "${ipv6_line:-None}"
+  printf '│ Managed rules: %-45s │\n' "$rule_count"
+  echo "└──────────────────────────────────────────────────────────────┘"
+}
+
 print_header() {
   if command -v clear >/dev/null 2>&1; then
     clear
   fi
   echo -e "${CYAN}${BOLD}iptables Forward Manager${NC}"
   echo "Persistent port forwarding without exposing raw iptables rules."
+  echo
+  print_server_info
   echo
 }
 

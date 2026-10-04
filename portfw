@@ -2,6 +2,7 @@
 set -Eeuo pipefail
 
 APP_NAME="iptables-forward-manager"
+VERSION="1.0.0"
 STATE_DIR="/etc/${APP_NAME}"
 RULES_FILE="${STATE_DIR}/rules.db"
 LOCK_FILE="/run/${APP_NAME}.lock"
@@ -11,9 +12,15 @@ DNAT_CHAIN="IFM_DNAT"
 SNAT_CHAIN="IFM_SNAT"
 FORWARD_CHAIN="IFM_FORWARD"
 
+RED='\033[0;31m'
 GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+MAGENTA='\033[0;35m'
 CYAN='\033[0;36m'
+WHITE='\033[0;37m'
 BOLD='\033[1m'
+DIM='\033[2m'
 NC='\033[0m'
 
 require_root() {
@@ -449,24 +456,29 @@ print_server_info() {
     ipv6_line+="$ipaddr"
   done < <(list_interface_ipv6 "$interface")
 
-  echo "┌──────────────────────────────────────────────────────────────┐"
-  printf '│ Host: %-22s Interface: %-20s │\n' "$hostname_value" "${interface:-N/A}"
-  printf '│ Primary IPv4: %-46s │\n' "${primary_ip:-N/A}"
-  printf '│ Other IPv4:   %-46s │\n' "${ipv4_line:-None}"
-  printf '│ IPv6:         %-46s │\n' "${ipv6_line:-None}"
-  printf '│ Managed rules: %-45s │\n' "$rule_count"
-  echo "└──────────────────────────────────────────────────────────────┘"
+  echo -e "${CYAN}┌──────────────────────────────────────────────────────────────┐${NC}"
+  printf "${CYAN}│${NC} ${YELLOW}Host:${NC} %-22s ${YELLOW}Interface:${NC} %-20s ${CYAN}│${NC}\n" "$hostname_value" "${interface:-N/A}"
+  printf "${CYAN}│${NC} ${YELLOW}Primary IPv4:${NC} ${GREEN}%-46s${NC} ${CYAN}│${NC}\n" "${primary_ip:-N/A}"
+  printf "${CYAN}│${NC} ${YELLOW}Other IPv4:${NC}   %-46s ${CYAN}│${NC}\n" "${ipv4_line:-None}"
+  printf "${CYAN}│${NC} ${YELLOW}IPv6:${NC}         %-46s ${CYAN}│${NC}\n" "${ipv6_line:-None}"
+  printf "${CYAN}│${NC} ${YELLOW}Managed rules:${NC} ${MAGENTA}%-45s${NC} ${CYAN}│${NC}\n" "$rule_count"
+  echo -e "${CYAN}└──────────────────────────────────────────────────────────────┘${NC}"
 }
 
 print_header() {
   if command -v clear >/dev/null 2>&1; then
     clear
   fi
-  echo -e "${CYAN}${BOLD}iptables Forward Manager${NC}"
-  echo "Persistent port forwarding without exposing raw iptables rules."
+  echo -e "${CYAN}${BOLD}iptables Forward Manager${NC}  ${DIM}|${NC}  ${YELLOW}v${VERSION}${NC}"
+  echo -e "${DIM}Persistent IPv4 port forwarding with safe managed iptables rules.${NC}"
   echo
   print_server_info
   echo
+}
+
+print_menu_item() {
+  local number="$1" label="$2" description="$3" color="$4"
+  printf "${BOLD}[%s]${NC} ${color}%-19s${NC} ${DIM}%s${NC}\n" "$number" "$label" "$description"
 }
 
 pause() {
@@ -477,12 +489,12 @@ pause() {
 interactive_menu() {
   while true; do
     print_header
-    echo "[1] Add Forwarding"
-    echo "[2] Edit Forwarding"
-    echo "[3] Delete Forwarding"
-    echo "[4] List Forwarding"
-    echo "[5] Delete All"
-    echo "[0] Exit"
+    print_menu_item "1" "Add Forwarding"    "Create a new forwarding rule" "$GREEN"
+    print_menu_item "2" "Edit Forwarding"   "Change an existing rule" "$YELLOW"
+    print_menu_item "3" "Delete Forwarding" "Remove one managed rule" "$RED"
+    print_menu_item "4" "List Forwarding"   "Show all managed rules" "$CYAN"
+    print_menu_item "5" "Delete All"        "Remove all managed rules" "$RED"
+    print_menu_item "0" "Exit"              "Close the manager" "$WHITE"
     echo
 
     local choice
@@ -500,11 +512,14 @@ interactive_menu() {
 }
 
 print_help() {
-  cat <<'HELP_EOF'
+  cat <<HELP_EOF
+iptables Forward Manager v${VERSION}
+
 Usage:
   portfw              Open the interactive manager
   portfw --apply      Rebuild managed iptables rules from saved state
   portfw --list       List saved forwarding rules
+  portfw --version    Show installed version
   portfw --help       Show this help
 HELP_EOF
 }
@@ -519,6 +534,7 @@ main() {
     "") interactive_menu ;;
     --apply) apply_rules ;;
     --list) list_rules ;;
+    --version|-v) echo "$VERSION" ;;
     --help|-h) print_help ;;
     *) print_help >&2; exit 2 ;;
   esac

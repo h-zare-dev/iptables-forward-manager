@@ -34,22 +34,23 @@ install_dependencies() {
     curl iproute2 iptables util-linux procps
 }
 
-download_file() {
-  local url="$1" destination="$2" mode="$3" tmp
-  tmp="$(mktemp)"
-  trap 'rm -f "$tmp"' RETURN
-
-  curl -fsSL "$url" -o "$tmp"
-  [[ -s "$tmp" ]] || { echo "ERROR: downloaded file is empty: $url" >&2; return 1; }
-  install -m "$mode" "$tmp" "$destination"
-}
-
 install_dependencies
+
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+curl -fsSL "$RAW_BASE/portfw" -o "$TMP_DIR/portfw"
+curl -fsSL "$RAW_BASE/iptables-forward-manager.service" -o "$TMP_DIR/iptables-forward-manager.service"
+
+[[ -s "$TMP_DIR/portfw" ]] || { echo "ERROR: downloaded portfw is empty." >&2; exit 1; }
+[[ -s "$TMP_DIR/iptables-forward-manager.service" ]] || { echo "ERROR: downloaded service file is empty." >&2; exit 1; }
+bash -n "$TMP_DIR/portfw"
+
 install -d -m 0700 "$STATE_DIR"
 [[ -e "$STATE_DIR/rules.db" ]] || install -m 0600 /dev/null "$STATE_DIR/rules.db"
 
-download_file "$RAW_BASE/portfw" "$BIN_PATH" 0755
-download_file "$RAW_BASE/iptables-forward-manager.service" "$SERVICE_PATH" 0644
+install -m 0755 "$TMP_DIR/portfw" "$BIN_PATH"
+install -m 0644 "$TMP_DIR/iptables-forward-manager.service" "$SERVICE_PATH"
 
 systemctl daemon-reload
 systemctl enable --now iptables-forward-manager.service >/dev/null

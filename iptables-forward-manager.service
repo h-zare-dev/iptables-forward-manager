@@ -1,0 +1,12 @@
+[Unit]
+Description=iptables Forward Manager - persistent managed port forwarding
+Wants=network-online.target
+After=network-online.target docker.service netfilter-persistent.service ufw.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/portfw --apply
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

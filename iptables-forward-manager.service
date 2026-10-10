@@ -6,6 +6,7 @@ After=network-online.target docker.service netfilter-persistent.service ufw.serv
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/portfw --apply
+ExecReload=/usr/local/bin/portfw --reload
 RemainAfterExit=yes
 
 [Install]

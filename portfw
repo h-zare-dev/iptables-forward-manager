@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 APP_NAME="iptables-forward-manager"
-VERSION="1.0.0"
+VERSION="1.1.0"
 STATE_DIR="/etc/${APP_NAME}"
 RULES_FILE="${STATE_DIR}/rules.db"
 LOCK_FILE="/run/${APP_NAME}.lock"
@@ -175,7 +175,10 @@ apply_rules() {
     [[ -n "${id:-}" ]] || continue
     protocol="$(normalize_protocol "$protocol")"
     for proto in $(protocols_for "$protocol"); do
-      iptables -w 5 -t nat -A "$DNAT_CHAIN" -p "$proto" --dport "$source_port" \
+      # Match any IPv4 address that is currently local to this host (primary
+      # or floating/secondary). xt_addrtype consults the routing/FIB state at
+      # packet time, so incoming addresses are not hardcoded into the rule.
+      iptables -w 5 -t nat -A "$DNAT_CHAIN" -m addrtype --dst-type LOCAL -p "$proto" --dport "$source_port" \
         -j DNAT --to-destination "${dest_ip}:${dest_port}"
       iptables -w 5 -t filter -A "$FORWARD_CHAIN" -d "${dest_ip}/32" -p "$proto" --dport "$dest_port" -j ACCEPT
       iptables -w 5 -t nat -A "$SNAT_CHAIN" -d "${dest_ip}/32" -p "$proto" --dport "$dest_port" \
@@ -487,6 +490,7 @@ interactive_menu() {
     print_menu_item "3" "Delete Forwarding" "Remove one managed rule" "$RED"
     print_menu_item "4" "List Forwarding"   "Show all managed rules" "$CYAN"
     print_menu_item "5" "Delete All"        "Remove all managed rules" "$RED"
+    print_menu_item "6" "Reload Rules"      "Rebuild rules and re-detect network IPs" "$MAGENTA"
     print_menu_item "0" "Exit"              "Close the manager" "$WHITE"
     echo
 
@@ -499,6 +503,17 @@ interactive_menu() {
       3) delete_rule || true; pause ;;
       4) list_rules || true; pause ;;
       5) delete_all_rules || true; pause ;;
+      6)
+        echo
+        echo -e "${MAGENTA}${BOLD}Reload Rules${NC}  ${DIM}Rebuild managed rules from saved state${NC}"
+        echo -e "${DIM}Re-detecting the current primary IPv4 and applying multi-IP rules...${NC}"
+        if apply_rules; then
+          echo -e "${GREEN}✓ Managed forwarding rules reloaded successfully.${NC}"
+        else
+          echo -e "${RED}ERROR:${NC} failed to reload managed forwarding rules." >&2
+        fi
+        pause
+        ;;
       0) exit 0 ;;
       *) echo -e "${RED}Invalid option.${NC}"; sleep 1 ;;
     esac
@@ -512,6 +527,7 @@ iptables Forward Manager v${VERSION}
 Usage:
   portfw              Open the interactive manager
   portfw --apply      Rebuild managed iptables rules from saved state
+  portfw --reload     Same as --apply; re-detect current network IPs and rebuild rules
   portfw --list       List saved forwarding rules
   portfw --version    Show installed version
   portfw --help       Show this help
@@ -526,7 +542,7 @@ main() {
 
   case "${1:-}" in
     "") interactive_menu ;;
-    --apply) apply_rules ;;
+    --apply|--reload) apply_rules ;;
     --list) list_rules ;;
     --version|-v) echo "$VERSION" ;;
     --help|-h) print_help ;;

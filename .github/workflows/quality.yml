@@ -33,3 +33,18 @@ jobs:
           printf 'edge.example.net|198.51.100.7\n' > "$tempdir/dns-cache.db"
           PORTFW_STATE_DIR="$tempdir" python3 portfw-nft render > "$tempdir/rules.nft"
           sudo nft -c -f "$tempdir/rules.nft"
+      - name: Native nftables atomic replacement (isolated network namespace)
+        run: |
+          tempdir="$(mktemp -d)"
+          ns="portfw-ci-$RANDOM"
+          trap 'sudo ip netns del "$ns" 2>/dev/null || true; rm -rf "$tempdir"' EXIT
+          sudo ip netns add "$ns"
+          printf '1|2001-2003|192.0.2.50|3001-3003|tcp\n' > "$tempdir/rules.db"
+          PORTFW_STATE_DIR="$tempdir" python3 portfw-nft render > "$tempdir/initial.nft"
+          sudo ip netns exec "$ns" nft -f "$tempdir/initial.nft"
+          printf '1|2001-2003|198.51.100.7|4001-4003|tcp\n' > "$tempdir/rules.db"
+          echo 'delete table ip ifm_portfw' > "$tempdir/replace.nft"
+          PORTFW_STATE_DIR="$tempdir" python3 portfw-nft render >> "$tempdir/replace.nft"
+          sudo ip netns exec "$ns" nft -c -f "$tempdir/replace.nft"
+          sudo ip netns exec "$ns" nft -f "$tempdir/replace.nft"
+          sudo ip netns exec "$ns" nft list table ip ifm_portfw | grep -q '198.51.100.7'

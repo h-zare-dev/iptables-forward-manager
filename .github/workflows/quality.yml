@@ -1,0 +1,35 @@
+name: Quality
+
+on:
+  push:
+    branches: [development, main, 'feature/**']
+  pull_request:
+    branches: [development, main]
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: quality
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Bash syntax
+        run: bash -n portfw install.sh install-native.sh
+      - name: Python syntax
+        run: python3 -m py_compile portfw-nft tests/test_native.py
+      - name: Native forwarding unit tests
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+      - name: nftables dry-run (no firewall mutations)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq nftables
+          tempdir="$(mktemp -d)"
+          trap 'rm -rf "$tempdir"' EXIT
+          printf '1|2001-2003,2010|192.0.2.50|3001-3003,8080|both\n2|5001|edge.example.net|6001|tcp\n' > "$tempdir/rules.db"
+          printf 'edge.example.net|198.51.100.7\n' > "$tempdir/dns-cache.db"
+          PORTFW_STATE_DIR="$tempdir" python3 portfw-nft render > "$tempdir/rules.nft"
+          sudo nft -c -f "$tempdir/rules.nft"

@@ -279,10 +279,10 @@ def apply(records, cache):
         raise PortfwError("nft executable not installed")
     primary = primary_ipv4()
     script = nft_config(records, cache, primary, existing=table_exists())
+    # Ensure prerequisites before committing the atomic firewall transaction.
+    run(["sysctl", "-w", "net.ipv4.ip_forward=1"], timeout=5)
     run(["nft", "-c", "-f", "-"], input=script, timeout=15)
     run(["nft", "-f", "-"], input=script, timeout=15)
-    # Only turn on forwarding after a successful ruleset commit.
-    run(["sysctl", "-w", "net.ipv4.ip_forward=1"], timeout=5)
 
 
 def updated_records(action, args, records):
@@ -307,6 +307,7 @@ def change(action, args):
     with locked():
         records = read_rules()
         cache = read_cache()
+        old_cache = dict(cache)
         proposed = updated_records(action, args, records)
         new_hosts = {r[2] for r in proposed if is_domain(r[2])}
         for host in sorted(new_hosts):
@@ -314,8 +315,18 @@ def change(action, args):
                 cache[host] = resolve(host)
         # Apply before persisting; a failed nft validation leaves saved state intact.
         apply(proposed, cache)
-        save_rules(proposed)
-        save_cache({k: v for k, v in cache.items() if k in new_hosts})
+        try:
+            save_rules(proposed)
+            save_cache({k: v for k, v in cache.items() if k in new_hosts})
+        except OSError as exc:
+            # Restore the previous nft transaction and disk state, best effort.
+            try:
+                apply(records, old_cache)
+                save_rules(records)
+                save_cache(old_cache)
+            except (OSError, PortfwError) as rollback_exc:
+                print(f"CRITICAL: persistence rollback failed: {rollback_exc}", file=sys.stderr)
+            raise PortfwError(f"Could not persist change: {exc}") from exc
     print(f"{action}: OK")
 
 
@@ -349,7 +360,14 @@ def refresh_dns():
             print("DNS: unchanged; firewall untouched")
             return
         apply(records, new_cache)
-        save_cache(new_cache)
+        try:
+            save_cache(new_cache)
+        except OSError as exc:
+            try:
+                apply(records, old_active)
+            except PortfwError as rollback_exc:
+                print(f"CRITICAL: DNS rollback failed: {rollback_exc}", file=sys.stderr)
+            raise PortfwError(f"Could not persist DNS cache: {exc}") from exc
         print("DNS: changes applied atomically")
 
 

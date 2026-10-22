@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+"""Guarded native nftables cutover with timed automatic fallback."""
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+ROOT = Path("/var/lib/portfw-native-migrate")
+CURRENT = ROOT / "current"
+LEGACY = "iptables-forward-manager.service"
+NATIVE = "portfw-nft.service"
+DNS_TIMER = "portfw-dns-refresh.timer"
+RULES = Path("/etc/iptables-forward-manager/rules.db")
+JUMPS = (
+    ("nat", "PREROUTING", "IFM_DNAT"),
+    ("nat", "POSTROUTING", "IFM_SNAT"),
+    ("filter", "FORWARD", "IFM_FORWARD"),
+)
+
+
+class CutoverError(Exception):
+    pass
+
+
+def log(message):
+    print(f"[portfw-migrate] {message}", flush=True)
+
+
+def run(*args, input=None, check=True):
+    try:
+        p = subprocess.run(args, input=input, text=True, capture_output=True, timeout=35)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise CutoverError(f"Cannot execute {args[0]}: {exc}") from exc
+    if check and p.returncode:
+        raise CutoverError(f"{' '.join(args)}: {p.stderr.strip() or p.stdout.strip()}")
+    return p
+
+
+def ok(*args):
+    return run(*args, check=False).returncode == 0
+
+
+def connected(table, chain, target):
+    return ok("iptables", "-w", "5", "-t", table, "-C", chain, "-j", target)
+
+
+def native_exists():
+    return ok("nft", "list", "table", "ip", "ifm_portfw")
+
+
+def preflight():
+    for binary in ("iptables", "iptables-save", "nft", "systemctl", "systemd-run", "portfw-nft", "ip"):
+        if not shutil.which(binary):
+            raise CutoverError(f"Missing executable: {binary}")
+    if not RULES.is_file():
+        raise CutoverError(f"Missing rules file: {RULES}")
+    if "(nf_tables)" not in run("iptables", "--version").stdout:
+        raise CutoverError("Requires iptables-nft backend")
+    if not ok("systemctl", "is-active", "--quiet", LEGACY) or not ok("systemctl", "is-enabled", "--quiet", LEGACY):
+        raise CutoverError("Legacy service must be active and enabled")
+    if ok("systemctl", "is-active", "--quiet", NATIVE) or ok("systemctl", "is-enabled", "--quiet", NATIVE):
+        raise CutoverError("Native service already enabled or active")
+    if ok("systemctl", "is-active", "--quiet", DNS_TIMER):
+        raise CutoverError("DNS timer must be inactive")
+    if native_exists():
+        raise CutoverError("Native table already exists")
+    for table, chain, target in JUMPS:
+        rules = run("iptables", "-w", "5", "-t", table, "-S", chain).stdout.splitlines()
+        count = sum(line.strip() == f"-A {chain} -j {target}" for line in rules)
+        if count != 1:
+            raise CutoverError(f"Expected exactly one jump {table}/{chain} -> {target}, found {count}")
+        run("iptables", "-w", "5", "-t", table, "-S", target)
+    run("portfw-nft", "check")
+    render = run("portfw-nft", "render").stdout
+    run("nft", "-c", "-f", "-", input=render)
+    route = run("ip", "-4", "route", "get", "1.1.1.1").stdout
+    match = re.search(r"\bsrc\s+(\d+\.\d+\.\d+\.\d+)", route)
+    if not match:
+        raise CutoverError("Primary IPv4 not detected")
+    snat = run("iptables", "-w", "5", "-t", "nat", "-S", "IFM_SNAT").stdout
+    if f"--to-source {match.group(1)}" not in snat:
+        raise CutoverError("Legacy SNAT primary IPv4 mismatch")
+    log("Read-only preflight PASSED; no firewall or service changes")
+
+
+def get_session():
+    if not CURRENT.exists():
+        raise CutoverError("No migration session")
+    folder = Path(CURRENT.read_text().strip())
+    if folder.parent != ROOT or not folder.name.startswith("backup-") or not folder.is_dir():
+        raise CutoverError("Bad migration backup path")
+    return folder
+
+
+def backup():
+    ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+    ROOT.chmod(0o700)
+    if CURRENT.exists() and (get_session() / "pending").exists():
+        raise CutoverError("Unconfirmed migration exists")
+    folder = ROOT / f"backup-{int(time.time())}-{os.getpid()}"
+    folder.mkdir(mode=0o700)
+    shutil.copy2(RULES, folder / "rules.db")
+    (folder / "iptables-save.txt").write_text(run("iptables-save").stdout)
+    (folder / "nft-ruleset.txt").write_text(run("nft", "-a", "list", "ruleset").stdout)
+    shutil.copy2(Path(__file__), folder / "rescue.py")
+    (folder / "rescue.py").chmod(0o700)
+    CURRENT.write_text(str(folder) + "\n")
+    CURRENT.chmod(0o600)
+    log(f"Backup ready: {folder}")
+    return folder
+
+
+def detach(table, chain, target):
+    if connected(table, chain, target):
+        run("iptables", "-w", "5", "-t", table, "-D", chain, "-j", target)
+
+
+def attach(table, chain, target):
+    if not connected(table, chain, target):
+        run("iptables", "-w", "5", "-t", table, "-I", chain, "1", "-j", target)
+
+
+def cancel_rescue(folder):
+    unit_file = folder / "unit"
+    if unit_file.exists():
+        unit = unit_file.read_text().strip()
+        if not re.fullmatch(r"portfw-native-rescue-\d+", unit):
+            raise CutoverError("Invalid rescue unit")
+        run("systemctl", "stop", unit + ".timer", check=False)
+
+
+def rollback():
+    folder = get_session()
+    log("Restoring original legacy forwarding...")
+    errors = []
+    for cmd in (("systemctl", "disable", "--now", NATIVE),):
+        try:
+            run(*cmd)
+        except CutoverError as exc:
+            errors.append(str(exc))
+    # Put old NAT and filter hooks back BEFORE removing the new native table.
+    for jump in JUMPS:
+        try:
+            attach(*jump)
+        except CutoverError as exc:
+            errors.append(str(exc))
+    if native_exists():
+        try:
+            run("nft", "delete", "table", "ip", "ifm_portfw")
+        except CutoverError as exc:
+            errors.append(str(exc))
+    try:
+        shutil.copy2(folder / "rules.db", RULES)
+        run("systemctl", "enable", "--now", LEGACY)
+    except (CutoverError, OSError) as exc:
+        errors.append(str(exc))
+    if errors:
+        raise CutoverError("INCOMPLETE rollback: " + " | ".join(errors))
+    (folder / "pending").unlink(missing_ok=True)
+    cancel_rescue(folder)
+    log("Legacy service and hooks restored; native disabled")
+
+
+def switch():
+    preflight()
+    folder = backup()
+    unit = f"portfw-native-rescue-{int(time.time())}"
+    (folder / "unit").write_text(unit + "\n")
+    (folder / "pending").touch()
+    try:
+        run("systemd-run", "--unit=" + unit, "--on-active=10min",
+            "--timer-property=AccuracySec=1s",
+            "/usr/bin/python3", str(folder / "rescue.py"), "rollback")
+        if not ok("systemctl", "is-active", "--quiet", unit + ".timer"):
+            raise CutoverError("Rescue timer was not armed")
+    except CutoverError:
+        (folder / "pending").unlink(missing_ok=True)
+        raise
+    log(f"Automatic rollback ARMED in 10 minutes: {unit}.timer")
+    try:
+        run("systemctl", "disable", "--now", LEGACY)
+        for jump in JUMPS:
+            detach(*jump)
+        run("portfw-nft", "apply")
+        run("systemctl", "enable", "--now", NATIVE)
+        if not native_exists() or not ok("systemctl", "is-active", "--quiet", NATIVE):
+            raise CutoverError("Native failed to start")
+        if any(connected(*jump) for jump in JUMPS):
+            raise CutoverError("A legacy hook still remains attached")
+    except CutoverError as exc:
+        log(f"FAILED: {exc}; restoring legacy immediately")
+        rollback()
+        raise
+    log("NATIVE ACTIVE. Test external TCP+UDP on source ports 1015 and 1020.")
+    log("After validating, run: sudo portfw-migrate confirm")
+    log("If not confirmed within 10 minutes, the server will automatically revert.")
+
+
+def confirm():
+    folder = get_session()
+    if not (folder / "pending").exists():
+        raise CutoverError("No pending cutover")
+    if not ok("systemctl", "is-active", "--quiet", NATIVE) or not ok("systemctl", "is-enabled", "--quiet", NATIVE):
+        raise CutoverError("Native service is not active/enabled")
+    if not native_exists() or any(connected(*jump) for jump in JUMPS):
+        raise CutoverError("Native table missing or old hooks still attached")
+    if ok("systemctl", "is-active", "--quiet", LEGACY):
+        raise CutoverError("Legacy service still active")
+    cancel_rescue(folder)
+    (folder / "pending").unlink(missing_ok=True)
+    log("CONFIRMED. Native enabled at boot; DNS timer remains disabled.")
+    log("WARNING: service checks alone do not prove external reachability.")
+
+
+def status():
+    for title, unit in (("Legacy", LEGACY), ("Native", NATIVE), ("DNS timer", DNS_TIMER)):
+        active = run("systemctl", "is-active", unit, check=False).stdout.strip()
+        enabled = run("systemctl", "is-enabled", unit, check=False).stdout.strip()
+        log(f"{title}: active={active}, enabled={enabled}")
+    log(f"Legacy DNAT hook: {'attached' if connected(*JUMPS[0]) else 'detached'}")
+    log(f"Native table: {'present' if native_exists() else 'absent'}")
+    if CURRENT.exists():
+        folder = get_session()
+        log(f"Backup: {folder}")
+        if (folder / "pending").exists():
+            unit = (folder / "unit").read_text().strip() + ".timer"
+            log("Watchdog: " + run("systemctl", "list-timers", "--all", "--no-pager", unit, check=False).stdout.strip())
+
+
+def main():
+    if os.geteuid() != 0:
+        raise CutoverError("Root required")
+    commands = {"preflight": preflight, "switch": switch, "confirm": confirm,
+                "rollback": rollback, "status": status}
+    if len(sys.argv) != 2 or sys.argv[1] not in commands:
+        print("Usage: portfw-migrate preflight|switch|status|confirm|rollback")
+        return 2
+    commands[sys.argv[1]]()
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (CutoverError, OSError) as exc:
+        log(f"ERROR: {exc}")
+        sys.exit(1)

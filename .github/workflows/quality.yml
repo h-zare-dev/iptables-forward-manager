@@ -20,7 +20,7 @@ jobs:
       - name: Bash syntax
         run: bash -n portfw install.sh install-native.sh tests/network_namespace.sh
       - name: Python syntax
-        run: python3 -m py_compile portfw-nft tests/test_native.py
+        run: python3 -m py_compile portfw-nft portfw-migrate tests/test_native.py tests/test_migrate.py
       - name: Native forwarding unit tests
         run: python3 -m unittest discover -s tests -p 'test_*.py' -v
       - name: nftables dry-run (no firewall mutations)

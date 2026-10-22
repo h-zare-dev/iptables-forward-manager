@@ -14,7 +14,7 @@ import subprocess
 import sys
 import tempfile
 
-VERSION = "2.0.0-rc2"
+VERSION = "2.0.0-rc3"
 STATE_DIR = Path(os.environ.get("PORTFW_STATE_DIR", "/etc/iptables-forward-manager"))
 RULES = STATE_DIR / "rules.db"
 CACHE = STATE_DIR / "dns-cache.db"

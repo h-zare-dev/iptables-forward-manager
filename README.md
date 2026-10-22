@@ -1,102 +1,43 @@
 # Port Forward Manager
 
-A terminal-based, persistent **IPv4 TCP/UDP port-forwarding manager for Linux** with a colorful interactive menu, native **nftables** maps/sets, and safe rule management.
+A lightweight terminal manager for **persistent IPv4 TCP/UDP port forwarding** on Linux, powered by native **nftables**. Includes a colorful menu, single/range/list port mappings, and support for primary and floating IPv4 addresses.
 
-**Current native version: v2.0.0-rc2**. The original iptables-based **v1.1.0** remains available for compatibility, but the native and legacy engines must **not** be operated simultaneously.
+## Quick start — fresh server
 
-| | Native v2 | Legacy v1 |
-| --- | --- | --- |
-| Command | `portfw-nft` | `portfw` |
-| Engine | Native nftables (table `ip ifm_portfw`) | iptables / iptables-nft (`IFM_*` chains) |
-| Single ports | ✅ | ✅ |
-| Inclusive ranges and comma-separated lists | ✅ | — |
-| Destination IPv4 or domain (A record) | ✅ | IPv4 only |
-| Independent DNS refresh timer | ✅ (opt-in) | — |
-| Primary + floating/secondary IPv4 | ✅ | ✅ |
-| Persistent systemd restore | `portfw-nft.service` | `iptables-forward-manager.service` |
-| Installer | `install-native.sh` | `install.sh` |
+For a **new Debian/Ubuntu server** that is **not already running the old Port Forward Manager**:
 
-> [!IMPORTANT]
-> **On a server migrated to native nftables, use only `portfw-nft`.** Do not run the old `portfw` menu, `portfw --reload`, or `iptables-forward-manager.service`: they can reattach legacy NAT hooks and conflict with the native rules. The two engines share the same rules database. Merely installing the native binaries does **not** migrate the running firewall.
-
-## Features
-
-- **Interactive, color-coded terminal UI** with hostname, network interface, primary IPv4, other/floating IPv4, global IPv6 addresses (display only), and managed rule count.
-- Create, edit, list, and delete one or all managed rules; reload native maps without rebooting.
-- Single ports: `1015`; inclusive ranges: `2001-2010`; comma lists: `2020,2030,2040`; mixed specifications: `2001-2003,2010,2020-2022`.
-- **Ordered 1:1 mapping** between source and destination ports. Rejects mismatched counts, duplicates, malformed port specs, and overlapping source ports for the same protocol.
-- `tcp`, `udp`, or `both`. Up to **4,096 expanded source ports per rule** and **10,000 protocol/port mappings** across all rules.
-- IPv4 destination or hostname resolved to an IPv4 **A record**, with a cached destination and a separately scheduled, optional DNS refresh.
-- Forwarding to all **currently local IPv4 addresses** on the host (primary and floating/secondary), without binding a rule to a specific incoming IPv4 address.
-- Explicit SNAT to the **current primary IPv4 source address**, re-detected when applying/reloading rules. No dependency on a separate Floating IP manager.
-- Owned nftables table, DNAT maps, FORWARD/SNAT sets, serialized writes, validation, and a single nftables batch to replace **only** that table. No global firewall flush and no conntrack flush.
-- `systemd` startup restore, independent DNS oneshot service/timer, and a guarded migration helper with backup and a **10-minute auto-rollback window**.
-
-The project currently **forwards IPv4 traffic only**; the IPv6 address shown in the menu is informational. For implementation constraints, see [Native architecture and limits](docs/NATIVE_NFT_CANDIDATE.md).
-
-## Requirements
-
-- Linux with kernel nftables/NAT support, a working IPv4 network stack and `systemd`.
-- Python 3, `nft`, `iptables` (for migration/legacy overlap detection), `ip`, `getent`, `flock`, and `curl`.
-- Root privileges for rule changes and service management.
-- Debian/Ubuntu are the intended installation targets. Other distributions may work if all prerequisites and systemd semantics match, but have not been validated here.
-- The destination must be reachable and the required traffic permitted by the provider firewall and any existing UFW/Docker/other filter rules.
-
-Example for Debian/Ubuntu **if dependencies are missing**:
+**1. Install dependencies** (skip if already installed):
 
 ```bash
 sudo apt-get update
 sudo apt-get install -y curl python3 nftables iptables iproute2 util-linux libc-bin
 ```
 
-## Install native nftables
-
-For the **current reviewed code on `main`**:
+**2. Install Port Forward Manager:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/h-zare-dev/iptables-forward-manager/main/install-native.sh \
-  | sudo PORTFW_REF=main bash
+curl -fsSL https://raw.githubusercontent.com/h-zare-dev/iptables-forward-manager/main/install-native.sh | sudo PORTFW_REF=main bash
 ```
 
-The native installer is **side-by-side and intentionally non-activating**. It:
-
-1. Installs `/usr/local/bin/portfw-nft` and `/usr/local/bin/portfw-migrate`.
-2. Installs the native restore and DNS systemd units, then reloads systemd unit definitions.
-3. **Does not** enable/disable either forwarding engine, enable the DNS timer, remove old rules, flush nftables, or start a migration.
-
-Inspect without modifying your active firewall:
-
-```bash
-portfw-nft --version
-portfw-nft check
-portfw-nft list
-systemctl is-enabled portfw-nft.service || true
-systemctl is-enabled portfw-dns-refresh.timer || true
-```
-
-On a **fresh host with no legacy forwarding rules**, first verify routing/provider firewall and make sure the legacy engine is not active. Adding a native rule via `portfw-nft add` **immediately applies it** to the kernel (it is not a draft). After verifying the resulting table and external TCP/UDP connectivity, explicitly enable persistent restore:
-
-```bash
-sudo portfw-nft list
-sudo systemctl enable --now portfw-nft.service
-systemctl is-enabled portfw-nft.service
-```
-
-These steps are for a clean native installation **only**, not for migrating a live legacy host. Never enable both forwarding engines.
-
-**Already using the original `portfw`?** Follow [Controlled legacy-to-native migration](docs/SAFE_NATIVE_CUTOVER.md) instead of enabling the native service directly.
-
-**Already running native nftables?** Re-running the installer from the intended branch refreshes the installed code/units without restarting your running forwarding service. Check the new binary version; don't start a legacy service.
-
-## Interactive menu
-
-Run (after native activation/migration):
+**3. Open the menu:**
 
 ```bash
 sudo portfw-nft
 ```
 
-The colored UI includes Host, Interface, Primary IPv4, Other IPv4, IPv6 (display only), and Managed rules. Options:
+**4. Add your first rule:** choose **[1] Add Forwarding**, then enter the source port, destination IPv4 (or domain), destination port, and protocol (`tcp`, `udp`, or `both`). Creating a rule **immediately applies it**; the destination must actually accept traffic on that port.
+
+**5. Enable forwarding persistence after verifying the new rule works from an external client:**
+
+```bash
+sudo systemctl enable --now portfw-nft.service
+```
+
+That's it. Open the menu any time with `sudo portfw-nft`.
+
+> **Already running the old `portfw` / iptables version?** Don't perform the fresh-install activation on top of it. Use the [upgrade and migration instructions](#moving-from-legacy-iptables-v110) near the end of this README.
+
+## Menu and basic usage
 
 ```text
 Port Forward Manager | Native nftables v2.0.0-rc2
@@ -112,131 +53,105 @@ Port Forward Manager | Native nftables v2.0.0-rc2
 [0] Exit                 Close the manager
 ```
 
-Add/Edit prompt for source ports, destination IPv4/domain, destination ports, and protocol (defaults to `both`). Editing allows Enter to keep the displayed existing value. Destructive menu actions request confirmation.
+The colored dashboard displays **hostname, interface, primary IPv4, secondary/floating IPv4, IPv6 (display only), and rule count**. Add/Edit let you keep existing values by pressing Enter; destructive menu operations require confirmation.
 
-### Port mapping examples
+### Example: a single port
 
-Each item expands **in the order written**, and source item #N maps to destination item #N.
+```text
+Source port(s):       1015
+Destination IPv4:     203.0.113.50
+Destination port(s):  2096
+Protocol:             both
+```
 
-| Source port(s) | Destination port(s) | Result |
+This sends TCP+UDP arriving on local port **1015** to destination `203.0.113.50:2096`. The destination address above is for documentation; substitute your own reachable server.
+
+### Port ranges and comma-separated lists
+
+Source and destination ports are mapped **one-to-one, in the order entered**.
+
+| Source port(s) | Destination port(s) | Mapping |
 | --- | --- | --- |
 | `1015` | `2096` | 1015 → 2096 |
 | `2001-2005` | `3001-3005` | 2001 → 3001, …, 2005 → 3005 |
 | `2020,2030,2040` | `3020,3030,3040` | 2020 → 3020; 2030 → 3030; 2040 → 3040 |
 | `2001-2003,2010` | `3001-3003,8080` | 2001 → 3001; 2002 → 3002; 2003 → 3003; 2010 → 8080 |
 
-An unequal range such as `2010-2020` (11 ports) → `2020-2040` (21 ports) is rejected, as is an overlapping TCP source port already present in another `tcp` or `both` rule.
+The program rejects overlapping source ports for the same protocol, duplicate ports, malformed ranges, and unequal source/destination counts. For example, `2010-2020` (11 ports) cannot map to `2020-2040` (21 ports).
 
-Example native CLI addition:
+## Main features
 
-```bash
-sudo portfw-nft add '2001-2003,2010' 203.0.113.50 '3001-3003,8080' both
-sudo portfw-nft add '2020,2030,2040' 203.0.113.50 '3020,3030,3040' tcp
-```
+- Native nftables **maps and sets** for DNAT, FORWARD and explicit SNAT; no per-packet DNS lookup.
+- Single ports, inclusive ranges, comma-separated lists, or combinations of both.
+- TCP, UDP or both, with up to **4,096 expanded ports per rule** and **10,000 protocol/port mappings** total.
+- Destination **IPv4 or hostname with an IPv4 A record**.
+- Incoming matching on any currently local IPv4 address, including **primary and floating/secondary IPs**. Forwarding configuration is independent of a Floating IP manager.
+- Persistent systemd restore; a **Reload** action detects the current primary IPv4 for SNAT.
+- Managed `ip ifm_portfw` table; no global nftables or conntrack flush. Configuration updates are validated and committed as a batch for the owned table.
+- Optional independent DNS refresh timer with configurable intervals.
 
-These use **documentation/example IPs**. Substitute a reachable real destination before use. The destination must actually listen on its selected ports for traffic to work.
+Only **IPv4** is forwarded; IPv6 is shown in the menu for server information.
 
-## Native CLI reference
+## Command-line usage
+
+The interactive menu is the easiest route. For automation:
 
 ```bash
 portfw-nft --version
 portfw-nft check
 portfw-nft list
-portfw-nft render                            # preview only: illustrative SNAT IP
-sudo portfw-nft                             # interactive menu
-sudo portfw-nft add SOURCE TARGET DESTPORTS tcp|udp|both
-sudo portfw-nft edit ID SOURCE TARGET DESTPORTS tcp|udp|both
-sudo portfw-nft delete ID
-sudo portfw-nft clear                       # deletes managed rules
-sudo portfw-nft reload                      # reapply the native table; detect primary IP
-sudo portfw-nft apply                       # same native reapplication
+
+sudo portfw-nft add '2001-2003,2010' 203.0.113.50 '3001-3003,8080' both
+sudo portfw-nft edit 1 '2001-2005' 203.0.113.50 '3001-3005' tcp
+sudo portfw-nft delete 1
+sudo portfw-nft reload
+sudo portfw-nft apply
 sudo systemctl reload portfw-nft.service
 ```
 
-Examples:
+To remove **all managed forwarding entries**: `sudo portfw-nft clear` (or menu option 5). Be careful on a busy server.
 
-```bash
-sudo portfw-nft edit 3 '2001-2005' 203.0.113.50 '3001-3005' both
-sudo portfw-nft delete 3
-```
+`portfw-nft render` is for **preview/dry-run only**, with an illustrative SNAT IPv4. **Don't load its rendered output directly into the live firewall.** Replace the example destination addresses in CLI samples with actual reachable hosts.
 
-**Careful:** `render` uses an **illustrative SNAT IPv4** for validation; its output is **not** intended to be directly loaded as a live ruleset. Applying/reloading can briefly affect new connections, so avoid unnecessary changes during peak traffic.
+## Domain destinations and optional DNS refresh
 
-## Domain destinations and DNS refresh (optional)
-
-A domain may replace a destination IPv4:
+A hostname can be used in place of a destination IPv4:
 
 ```bash
 sudo portfw-nft add '1010' edge.example.net '2096' both
 ```
 
-This performs an **initial IPv4 A-record lookup**. A failed lookup or invalid destination rejects the new rule. Domain traffic is forwarded to the **resolved IPv4**, not to a DNS name in the kernel; DNS resolution **does not occur per packet**.
+- Adding a domain resolves its IPv4 **A record** and caches the selected IPv4; an invalid or unresolvable domain is rejected.
+- A hostname with multiple A records uses the **numerically lowest** eligible address, not load balancing. Proxied DNS services may return a proxy IP rather than an origin.
+- AAAA-only/IPv6 destinations aren't supported.
+- Existing conntrack sessions aren't moved to a newly resolved destination.
+- DNS lookups run outside the packet path; an unchanged or failed lookup doesn't replace the current valid mapping.
 
-- **IPv4 A records only**; AAAA-only destinations are unsupported.
-- If multiple IPv4 A records exist, the current resolver chooses the numerically lowest eligible address. This is **not** DNS-based balancing or health checking.
-- A proxied hostname (e.g. Cloudflare orange-cloud) may resolve to a CDN proxy rather than the origin; only use a hostname/port combination whose returned IP accepts the intended forwarding protocol.
-- The cached IPv4 stays in use if a later DNS check fails; successful DNS changes affect **new connections**, not already established conntrack mappings.
-- Changing a domain's DNS does not automatically change the kernel mapping unless the refresh action/timer is run.
-
-Manual refresh:
+Refresh manually:
 
 ```bash
 sudo portfw-nft dns-refresh
 ```
 
-Independent `systemd` timer (installed **disabled**, default **5 minutes**):
+Or optionally enable the independent systemd timer (installed **disabled**, default **5 minutes**):
 
 ```bash
 sudo portfw-nft timer --minutes 5 --enable
 sudo portfw-nft timer --minutes 30
 sudo portfw-nft timer --disable
-systemctl status portfw-dns-refresh.timer --no-pager
 ```
 
-Available intervals (minutes): **1, 2, 3, 5, 10, 15, 20, 30, 45, 60**. The schedule uses `OnUnitInactiveSec` and `AccuracySec=30s`, so it isn't tied to exact wall-clock boundaries. Menu option **7** offers the same settings, and option **8** triggers a manual refresh.
+Menu options **7** and **8** provide the same timer configuration/manual refresh. Available intervals in minutes: **1, 2, 3, 5, 10, 15, 20, 30, 45, 60**. Timing is approximate rather than aligned to the clock minute.
 
-The DNS service performs lookups outside the packet path. If the result doesn't change, **no nftables update is made**. When it changes, the engine validates and submits a batch updating only its own table; unrelated rules and conntrack are not flushed.
+> **Testing note:** automatic DNS changes and high-throughput stability under live destination-IP rotation have not yet been fully end-to-end validated. Keep the timer disabled until you've confirmed behavior with your own DNS records.
 
-> [!WARNING]
-> A live domain A-record change, DNS failure/recovery, and high-throughput stability have **not yet been end-to-end validated on the production traffic path**. Leave auto-refresh disabled until you have tested your own DNS records and can verify reachability/rollback.
+## Service, persistence, and troubleshooting
 
-## Migration from legacy iptables (v1.1.0)
+The native service `portfw-nft.service` restores the managed rules at boot, after network-online. State is stored in `/etc/iptables-forward-manager/rules.db`; domain cache in `/etc/iptables-forward-manager/dns-cache.db`.
 
-The legacy program `portfw` is retained. Do **not** try to migrate by simply stopping its systemd service: it has no `ExecStop`, so old NAT jumps can remain attached.
+For a fresh native installation, the installer deliberately **doesn't start or enable** the service. The Quick Start instructions show how to enable it after a verified rule. If the **primary IPv4 changes**, run `sudo portfw-nft reload` to update the SNAT source. Secondary/floating IPv4s are matched when the kernel considers them local.
 
-Use the separate migration utility and the full [safe cutover and rollback guide](docs/SAFE_NATIVE_CUTOVER.md). Summary:
-
-```bash
-sudo portfw-migrate preflight        # read-only prerequisite check
-sudo portfw-migrate status           # current engines / rollback state
-
-# Planned maintenance window + second SSH/provider-console access:
-sudo portfw-migrate switch           # arms a 10-minute fallback; changes the active engine
-sudo portfw-migrate status
-
-# FIRST test real TCP and UDP access via your forwarded IPs and ports.
-sudo portfw-migrate confirm          # only if checks passed, within the rollback window
-
-# If cutover failed or you decide to revert:
-sudo portfw-migrate rollback
-```
-
-The helper backs up `rules.db`, `iptables-save`, and `nft list ruleset`; preserves the managed legacy chains while detaching their three jump rules; and arms a **10-minute systemd rescue timer** before the cutover. The watchdog is not a guarantee of zero interruption or successful restoration under all failure conditions.
-
-**Do not run `preflight`/`switch` a second time on an already migrated native host.** The native service and table should now be active and the legacy DNAT jump detached. A migration rollback restores the saved database from **cutover time**: rules created later would be lost unless separately backed up.
-
-## Persistence, routing, and firewall boundaries
-
-- Stored state: `/etc/iptables-forward-manager/rules.db`; DNS cache: `/etc/iptables-forward-manager/dns-cache.db`.
-- On an **activated native** host, `portfw-nft.service` restores the native rules after network-online at boot; it is a oneshot with `RemainAfterExit=yes`.
-- Engine-owned kernel rules live in table **`ip ifm_portfw`**, with DNAT maps and FORWARD/SNAT sets for TCP and UDP.
-- An inbound rule can match any IPv4 address Linux considers **local**, including primary/floating addresses. The primary IPv4 used for outbound SNAT is determined from the current IPv4 route at apply/reload time.
-- If the primary IPv4 changes, run `sudo portfw-nft reload` so the new SNAT source is detected. A floating-IP address becoming local is handled by the kernel's local-address match.
-- The manager **does not manage an external Floating IP service** and is intentionally independent of any such tool.
-- It doesn't flush unrelated nftables tables, iptables, Docker/UFW, or the conntrack table. **An `accept` in the managed nftables filter chain cannot override a `drop` from another base chain**: verify the full forwarding policy of your system.
-- `clear` and menu "Delete All" remove only this tool's managed forwarding entries; do not use them to troubleshoot an unrelated firewall.
-
-### Diagnostics (read-only)
+Read-only checks:
 
 ```bash
 portfw-nft check
@@ -249,30 +164,72 @@ systemctl is-enabled portfw-dns-refresh.timer || true
 journalctl -u portfw-nft.service -n 50 --no-pager
 ```
 
-A saved rule and a matching kernel map entry confirm the **configuration**, not successful delivery to the target. Validate end-to-end with real TCP/UDP clients and check destination listeners, routing and external firewalls. Native nftables itself is **not** a proven fix for network jitter or upstream congestion.
+The service can report `active (exited)`: this is normal for its `oneshot`/persistent configuration. A matching rule in the nftables map proves the configuration is present, **not** end-to-end connectivity. Test the actual TCP/UDP service, destination listeners, provider firewall and routing. Existing Docker/UFW/other base chains can still drop traffic; one nftables `accept` doesn't override another chain's `drop`.
 
-## Quality assurance and known limits
+## Updating an existing native installation
 
-GitHub Actions runs **Quality** and **Shell syntax** on feature pushes and PRs. Quality covers Python/unit tests, rule parsing/validation, DNS cache updates/fallback, UI, migration order/rollback mocks, a native `nft -c` dry-run, table replacement in an isolated network namespace, and actual TCP+UDP forwarding/SNAT using temporary client/router/server network namespaces.
+If you're **already using `portfw-nft`**, the same installer updates the installed binary and systemd units **without restarting or reconfiguring the active forwarding rules**:
 
-Manual `test-de` validation covered the native cutover, displayed native maps, source range/list creation, conflict rejection, unequal-count rejection, UI v2.0.0-rc2, and removal of test rules. **It does not certify** live DNS refresh/failover, every provider firewall combination, sustained multi-Gbps throughput, or zero-packet-loss upgrades.
+```bash
+curl -fsSL https://raw.githubusercontent.com/h-zare-dev/iptables-forward-manager/main/install-native.sh | sudo PORTFW_REF=main bash
+portfw-nft --version
+portfw-nft list
+```
 
-### Repository workflow
+Do not run the legacy installer or commands as part of a native update. A code update does not automatically change the currently loaded nftables table; schedule reapplication separately if needed and verify connectivity. For `development` feature testing, choose the matching `PORTFW_REF` and installer branch on a test host only.
 
-`development` is the default branch. Changes start in `feature/*`, are PR'd to `development`, validated by CI and on a test server, then promoted via an owner-reviewed PR from `development` to `main`. Don't deploy development experiments automatically to production.
+## Moving from legacy iptables (v1.1.0)
 
-For a reviewed native install from the stable branch use `PORTFW_REF=main`; for testing a specific feature, use that `PORTFW_REF` **only on a test server**.
+If your server already uses the old `portfw` (iptables) engine, **don't enable the native service directly**. The two engines share the same database and overlapping NAT hooks can break forwarding. The legacy service's stop action also does not remove its old jumps.
 
-## Legacy compatibility (v1.1.0)
+Install the native files side by side using the Quick Start installer, then use **`portfw-migrate`** during a low-traffic maintenance window. Have a second SSH session or provider console available. Full steps and limitations: [Safe migration and rollback guide](docs/SAFE_NATIVE_CUTOVER.md).
 
-The original Bash/iptables engine remains available when needed:
+```bash
+sudo portfw-migrate preflight  # only checks; no changes
+sudo portfw-migrate status
+
+sudo portfw-migrate switch     # arms independent 10-minute automatic rollback
+sudo portfw-migrate status
+
+# Test external TCP and UDP connections through the forwarded ports first:
+sudo portfw-migrate confirm    # only if tested and successful within 10 minutes
+
+# If something fails:
+sudo portfw-migrate rollback
+```
+
+The migration backs up the current state and detaches only the legacy managed jumps, retaining rollback capability. The automatic rescue timer is **not a guarantee** of uninterrupted service. **Never run `portfw-migrate switch` again on an already-migrated native host.** After `confirm`, use only `portfw-nft`, never legacy `portfw --reload`. Manual rollback later restores the rules saved **at cutover time** (newer changes may be lost).
+
+## Native versus legacy — reference
+
+| | Native nftables v2.0.0-rc2 | Legacy iptables v1.1.0 |
+| --- | --- | --- |
+| Command | `portfw-nft` | `portfw` |
+| Installer | `install-native.sh` | `install.sh` |
+| Engine | Dedicated `ip ifm_portfw` nftables table | iptables / iptables-nft `IFM_*` chains |
+| Single ports | Yes | Yes |
+| Port ranges / comma-separated lists | Yes | No |
+| Destination domain (IPv4 A) | Yes | No |
+| Independent DNS timer | Yes (opt-in) | No |
+| Primary + floating IPv4 | Yes | Yes |
+| Persistent service | `portfw-nft.service` | `iptables-forward-manager.service` |
+
+Legacy installs for legacy-only servers:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/h-zare-dev/iptables-forward-manager/main/install.sh | sudo bash
 sudo portfw
 ```
 
-On a legacy-only server its CLI is `portfw --list`, `portfw --apply`, and `portfw --reload`. **Do not execute those commands on servers already migrated to native nftables.** Legacy does not support native range/list/domain functionality.
+On legacy-only servers, `portfw --list`, `portfw --apply`, and `portfw --reload` remain available. **Never run these on servers already migrated to native nftables.**
+
+## Development and testing
+
+This repository uses **`development` as the default branch**. The normal flow is `feature/*` → PR to `development` → CI/manual test → owner-reviewed PR to `main`.
+
+GitHub Actions **Quality** and **Shell syntax** cover parsing and invalid cases, UI, migration ordering, DNS-cache behavior, nftables dry runs, and real TCP/UDP forwarding + SNAT in isolated network namespaces. Manual `test-de` testing included migration, native maps, range/list creation and validation. These do **not** certify every firewall setup, low jitter under all loads, or zero-packet-loss cutovers.
+
+For implementation and compatibility details, see [Native engine technical reference](docs/NATIVE_NFT_CANDIDATE.md).
 
 ## License
 

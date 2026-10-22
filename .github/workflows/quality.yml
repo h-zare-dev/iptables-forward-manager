@@ -18,7 +18,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Bash syntax
-        run: bash -n portfw install.sh install-native.sh
+        run: bash -n portfw install.sh install-native.sh tests/network_namespace.sh
       - name: Python syntax
         run: python3 -m py_compile portfw-nft tests/test_native.py
       - name: Native forwarding unit tests
@@ -33,6 +33,8 @@ jobs:
           printf 'edge.example.net|198.51.100.7\n' > "$tempdir/dns-cache.db"
           PORTFW_STATE_DIR="$tempdir" python3 portfw-nft render > "$tempdir/rules.nft"
           sudo nft -c -f "$tempdir/rules.nft"
+      - name: Real TCP and UDP forwarding in three isolated network namespaces
+        run: sudo bash tests/network_namespace.sh
       - name: Native nftables atomic replacement (isolated network namespace)
         run: |
           tempdir="$(mktemp -d)"

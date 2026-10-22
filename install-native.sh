@@ -17,17 +17,18 @@ for cmd in curl python3 nft ip getent flock systemctl; do
 done
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
-for filename in portfw-nft portfw-nft.service portfw-dns-refresh.service portfw-dns-refresh.timer; do
+for filename in portfw-nft portfw-migrate portfw-nft.service portfw-dns-refresh.service portfw-dns-refresh.timer; do
   curl -fsSL "$RAW/$filename" -o "$tmp/$filename"
   test -s "$tmp/$filename" || { echo "Empty: $filename" >&2; exit 1; }
 done
-python3 -m py_compile "$tmp/portfw-nft"
+python3 -m py_compile "$tmp/portfw-nft" "$tmp/portfw-migrate"
 install -m 0755 "$tmp/portfw-nft" /usr/local/bin/portfw-nft
+install -m 0755 "$tmp/portfw-migrate" /usr/local/bin/portfw-migrate
 for unit in portfw-nft.service portfw-dns-refresh.service portfw-dns-refresh.timer; do
   install -m 0644 "$tmp/$unit" "/etc/systemd/system/$unit"
 done
 systemctl daemon-reload
 echo "Native candidate installed SIDE BY SIDE (not activated)."
 echo "Legacy iptables-forward-manager.service and portfw remain unchanged."
-echo "Inspect: portfw-nft check && portfw-nft render"
+echo "Inspect: portfw-nft check && portfw-nft render && portfw-migrate preflight"
 echo "Do NOT enable portfw-nft.service before controlled legacy-rule cutover."

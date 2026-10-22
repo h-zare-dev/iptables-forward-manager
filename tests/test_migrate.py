@@ -15,12 +15,15 @@ loader.exec_module(m)
 
 class CutoverTests(unittest.TestCase):
     def test_preflight_rejects_non_iptables_nft(self):
-        with patch.object(m.shutil, "which", return_value="/bin/true"), \
-             patch.object(m.RULES, "is_file", return_value=True), \
-             patch.object(m, "run") as run:
-            run.return_value.stdout = "iptables v1.8.11 (legacy)"
-            with self.assertRaisesRegex(m.CutoverError, "iptables-nft"):
-                m.preflight()
+        with tempfile.TemporaryDirectory() as tmp:
+            rules = Path(tmp) / "rules.db"
+            rules.write_text("1|1015|192.0.2.50|2096|both\\n")
+            with patch.object(m.shutil, "which", return_value="/bin/true"), \
+                 patch.object(m, "RULES", rules), \
+                 patch.object(m, "run") as run:
+                run.return_value.stdout = "iptables v1.8.11 (legacy)"
+                with self.assertRaisesRegex(m.CutoverError, "iptables-nft"):
+                    m.preflight()
 
     def test_preflight_rejects_missing_native_tool(self):
         with patch.object(m.shutil, "which", side_effect=lambda cmd: None if cmd == "portfw-nft" else "/bin/true"):

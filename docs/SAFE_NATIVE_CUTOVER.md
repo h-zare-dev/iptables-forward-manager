@@ -2,19 +2,19 @@
 
 ## Status and boundaries
 
-This procedure is **only for an already working legacy installation** on a Debian/Ubuntu host with `iptables -V` showing `(nf_tables)`. It was designed for `test-de`, which currently has two forwarding entries: TCP+UDP source port 1015 and 1020. It does **not** enable domain refresh, edit destinations, or change the database schema.
+This procedure is **only for an already working legacy installation** on a Debian/Ubuntu host with `iptables -V` showing `(nf_tables)`. It was first exercised on `test-de` with two forwarding entries: TCP+UDP source ports 1015 and 1020. This server has already completed cutover, so **do not run `switch` there a second time**. It does **not** enable domain refresh, edit destinations, or change the database schema.
 
 **Expect a brief interruption of new TCP/UDP flows during the cutover.** No tool can guarantee packet-loss-free cross-engine migration. Existing conntrack mappings are never flushed, but their targets must remain reachable. Plan a low-traffic maintenance window, have an independent SSH session or provider console available, and test both forwarded ports externally before confirming.
 
 ## Install migration helper
 
-The candidate installer installs this helper alongside the legacy and native binaries, without activating either engine:
+The native installer from `main` installs the migration helper alongside the legacy and native binaries, without activating either engine:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/h-zare-dev/iptables-forward-manager/development/install-native.sh | sudo PORTFW_REF=development bash
 ```
 
-For feature testing before merging this PR, use `feature/safe-native-cutover` as both the installer URL ref and `PORTFW_REF` value.
+For development-only testing, use the intended `feature/*` branch as both the installer URL ref and `PORTFW_REF` value, and verify the exact commit on a non-production host. Current reviewed native release is `v2.0.0-rc3` on `main`.
 
 Check:
 
@@ -79,3 +79,9 @@ This restores the original `rules.db` and all three old jumps, removes **only** 
 ## CI coverage
 
 `tests/test_migrate.py` checks watchdog-before-detach ordering, reattach-before-native-delete fallback, safe refusal of unsupported backend and confirmation safety. Existing `quality` tests still exercise real TCP/UDP translation inside isolated namespaces. Manual on-host testing remains mandatory.
+
+## Already migrated to native?
+
+After `confirm`, the native `portfw-nft.service` is enabled and the legacy service is disabled. For routine edits/reload use `sudo portfw-nft`, `sudo portfw-nft list`, and `sudo portfw-nft reload`; **do not run `portfw-migrate switch` again** or use the legacy `portfw --reload` on that host. The root [README](../README.md) is the current operator manual for v2.0.0-rc3.
+
+A manual `portfw-migrate rollback` restores the rules database **as saved at the original cutover**; any later additions/edits would be lost unless backed up separately. DNS refresh is independent and should remain opt-in pending your A-record change testing.

@@ -14,7 +14,7 @@ import subprocess
 import sys
 import tempfile
 
-VERSION = "2.0.0-rc2"
+VERSION = "2.0.0-rc3"
 STATE_DIR = Path(os.environ.get("PORTFW_STATE_DIR", "/etc/iptables-forward-manager"))
 RULES = STATE_DIR / "rules.db"
 CACHE = STATE_DIR / "dns-cache.db"
@@ -305,9 +305,35 @@ def updated_records(action, args, records):
     return validate_rules(records)
 
 
+def _enable_persistence_after_first_add():
+    """Register the restore service for future boots, without reapplying live NAT.
+
+    Called only after the first rule has been applied and saved successfully.
+    Explicit service disable on an existing installation is not overridden.
+    """
+    unit = "portfw-nft.service"
+    try:
+        state = run(["systemctl", "is-enabled", unit], timeout=5, check=False)
+        if state.stdout.strip() == "enabled":
+            return
+        if state.stdout.strip() != "disabled":
+            raise PortfwError(f"Service {unit} is not available for enabling: "
+                              f"{state.stdout.strip() or state.stderr.strip()}")
+        # No --now: the first add already populated the kernel nftables table.
+        run(["systemctl", "enable", unit], timeout=15)
+        print("Boot persistence enabled: portfw-nft.service")
+    except PortfwError as exc:
+        # The rule is already live and saved; don't claim its application failed.
+        print(f"WARNING: Forwarding rule is active, but automatic boot restore "
+              f"could not be enabled: {exc}. Check 'systemctl enable {unit}'.",
+              file=sys.stderr)
+
+
 def change(action, args):
+    first_add = False
     with locked():
         records = read_rules()
+        first_add = action == "add" and not records
         cache = read_cache()
         old_cache = dict(cache)
         proposed = updated_records(action, args, records)
@@ -329,6 +355,8 @@ def change(action, args):
             except (OSError, PortfwError) as rollback_exc:
                 print(f"CRITICAL: persistence rollback failed: {rollback_exc}", file=sys.stderr)
             raise PortfwError(f"Could not persist change: {exc}") from exc
+    if first_add:
+        _enable_persistence_after_first_add()
     print(f"{action}: OK")
 
 

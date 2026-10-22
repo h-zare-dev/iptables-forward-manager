@@ -1,6 +1,6 @@
-# Native nftables v2.0.0-rc2 — technical reference
+# Native nftables v2.0.0-rc3 — technical reference
 
-**Status:** Native nftables v2.0.0-rc2 is available from `main`. The side-by-side installer remains intentionally **non-activating**: it does not migrate or restart the firewall. The legacy `portfw` (iptables-nft) and its service are retained for compatibility, but must not run alongside the activated native engine. See the [README](../README.md) for normal operation and [safe cutover guide](SAFE_NATIVE_CUTOVER.md) for migration.
+**Status:** Native nftables v2.0.0-rc3 is available from `main`. The side-by-side installer remains intentionally **non-activating**: it does not migrate or restart the firewall. The legacy `portfw` (iptables-nft) and its service are retained for compatibility, but must not run alongside the activated native engine. See the [README](../README.md) for normal operation and [safe cutover guide](SAFE_NATIVE_CUTOVER.md) for migration.
 
 ## Why a separate native executable?
 
@@ -116,4 +116,4 @@ Available timer intervals: **1, 2, 3, 5 (default), 10, 15, 20, 30, 45 and 60 min
 
 Quality CI additionally executes actual TCP/UDP forwarding and SNAT across isolated Linux network namespaces and tests the migration ordering/UI behavior. The migration and port range/list creation were manually exercised on `test-de`; the temporary test rules were removed afterwards. What CI and these spot tests **do not** establish: live DNS A-record rotation, sustained production multi-Gbps throughput, interoperability with every external firewall, jitter improvements or zero-disruption migration. Those need separate on-host verification.
 
-Release workflow: feature branch → PR to `development` → CI and manual test on `test-de` → owner-reviewed PR from `development` to `main`. v2.0.0-rc2 has already been promoted to `main`; future changes use the same workflow.
+Release workflow: feature branch → PR to `development` → CI and manual test on `test-de` → owner-reviewed PR from `development` to `main`. v2.0.0-rc3 has already been promoted to `main`; future changes use the same workflow.

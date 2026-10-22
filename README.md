@@ -32,7 +32,7 @@ A terminal-based, persistent **IPv4 TCP/UDP port-forwarding manager for Linux** 
 - Owned nftables table, DNAT maps, FORWARD/SNAT sets, serialized writes, validation, and a single nftables batch to replace **only** that table. No global firewall flush and no conntrack flush.
 - `systemd` startup restore, independent DNS oneshot service/timer, and a guarded migration helper with backup and a **10-minute auto-rollback window**.
 
-The project currently **forwards IPv4 traffic only**; the IPv6 address shown in the menu is informational.
+The project currently **forwards IPv4 traffic only**; the IPv6 address shown in the menu is informational. For implementation constraints, see [Native architecture and limits](docs/NATIVE_NFT_CANDIDATE.md).
 
 ## Requirements
 
@@ -74,7 +74,15 @@ systemctl is-enabled portfw-nft.service || true
 systemctl is-enabled portfw-dns-refresh.timer || true
 ```
 
-On a fresh host with no legacy forwarding rules, establish and verify the intended rules and firewall policies **before** explicitly activating `portfw-nft.service`. Do not simply enable both legacy and native services.
+On a **fresh host with no legacy forwarding rules**, first verify routing/provider firewall and make sure the legacy engine is not active. Adding a native rule via `portfw-nft add` **immediately applies it** to the kernel (it is not a draft). After verifying the resulting table and external TCP/UDP connectivity, explicitly enable persistent restore:
+
+```bash
+sudo portfw-nft list
+sudo systemctl enable --now portfw-nft.service
+systemctl is-enabled portfw-nft.service
+```
+
+These steps are for a clean native installation **only**, not for migrating a live legacy host. Never enable both forwarding engines.
 
 **Already using the original `portfw`?** Follow [Controlled legacy-to-native migration](docs/SAFE_NATIVE_CUTOVER.md) instead of enabling the native service directly.
 

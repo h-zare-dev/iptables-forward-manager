@@ -34,7 +34,7 @@ That's it. Test connectivity from an external client, and open the menu any time
 ## Menu and basic usage
 
 ```text
-Port Forward Manager | Native nftables v2.0.0-rc2
+Port Forward Manager | Native nftables v2.0.0-rc3
 
 [1] Add Forwarding       Create a new forwarding rule
 [2] Edit Forwarding      Modify an existing rule
@@ -204,7 +204,7 @@ The migration backs up the current state and detaches only the legacy managed ju
 
 ## Native versus legacy — reference
 
-| | Native nftables v2.0.0-rc2 | Legacy iptables v1.1.0 |
+| | Native nftables v2.0.0-rc3 | Legacy iptables v1.1.0 |
 | --- | --- | --- |
 | Command | `portfw-nft` | `portfw` |
 | Installer | `install-native.sh` | `install.sh` |

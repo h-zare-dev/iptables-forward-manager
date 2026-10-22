@@ -67,6 +67,11 @@ def preflight():
         raise CutoverError("DNS timer must be inactive")
     if native_exists():
         raise CutoverError("Native table already exists")
+    # A separate persistent rules restore could reattach IFM hooks on reboot.
+    saved_rules = Path("/etc/iptables/rules.v4")
+    if saved_rules.is_file() and "IFM_DNAT" in saved_rules.read_text():
+        if ok("systemctl", "is-enabled", "--quiet", "netfilter-persistent.service"):
+            raise CutoverError("netfilter-persistent may restore legacy IFM hooks on reboot; inspect rules.v4 before cutover")
     for table, chain, target in JUMPS:
         rules = run("iptables", "-w", "5", "-t", table, "-S", chain).stdout.splitlines()
         count = sum(line.strip() == f"-A {chain} -j {target}" for line in rules)
@@ -190,7 +195,7 @@ def switch():
             raise CutoverError("Native failed to start")
         if any(connected(*jump) for jump in JUMPS):
             raise CutoverError("A legacy hook still remains attached")
-    except CutoverError as exc:
+    except (CutoverError, OSError, KeyboardInterrupt) as exc:
         log(f"FAILED: {exc}; restoring legacy immediately")
         rollback()
         raise

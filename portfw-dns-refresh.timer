@@ -1,0 +1,11 @@
+[Unit]
+Description=Check Port Forward Manager destination DNS periodically
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=5min
+AccuracySec=30s
+Unit=portfw-dns-refresh.service
+
+[Install]
+WantedBy=timers.target

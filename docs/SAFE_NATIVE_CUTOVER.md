@@ -14,7 +14,7 @@ The native installer from `main` installs the migration helper alongside the leg
 curl -fsSL https://raw.githubusercontent.com/h-zare-dev/iptables-forward-manager/development/install-native.sh | sudo PORTFW_REF=development bash
 ```
 
-For development-only testing, use the intended `feature/*` branch as both the installer URL ref and `PORTFW_REF` value, and verify the exact commit on a non-production host. Current reviewed native release is `v2.0.0-rc2` on `main`.
+For development-only testing, use the intended `feature/*` branch as both the installer URL ref and `PORTFW_REF` value, and verify the exact commit on a non-production host. Current reviewed native release is `v2.0.0-rc3` on `main`.
 
 Check:
 
@@ -82,6 +82,6 @@ This restores the original `rules.db` and all three old jumps, removes **only** 
 
 ## Already migrated to native?
 
-After `confirm`, the native `portfw-nft.service` is enabled and the legacy service is disabled. For routine edits/reload use `sudo portfw-nft`, `sudo portfw-nft list`, and `sudo portfw-nft reload`; **do not run `portfw-migrate switch` again** or use the legacy `portfw --reload` on that host. The root [README](../README.md) is the current operator manual for v2.0.0-rc2.
+After `confirm`, the native `portfw-nft.service` is enabled and the legacy service is disabled. For routine edits/reload use `sudo portfw-nft`, `sudo portfw-nft list`, and `sudo portfw-nft reload`; **do not run `portfw-migrate switch` again** or use the legacy `portfw --reload` on that host. The root [README](../README.md) is the current operator manual for v2.0.0-rc3.
 
 A manual `portfw-migrate rollback` restores the rules database **as saved at the original cutover**; any later additions/edits would be lost unless backed up separately. DNS refresh is independent and should remain opt-in pending your A-record change testing.

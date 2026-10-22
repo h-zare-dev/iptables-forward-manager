@@ -25,15 +25,9 @@ curl -fsSL https://raw.githubusercontent.com/h-zare-dev/iptables-forward-manager
 sudo portfw-nft
 ```
 
-**4. Add your first rule:** choose **[1] Add Forwarding**, then enter the source port, destination IPv4 (or domain), destination port, and protocol (`tcp`, `udp`, or `both`). Creating a rule **immediately applies it**; the destination must actually accept traffic on that port.
+**4. Add your first rule:** choose **[1] Add Forwarding**, then enter the source port, destination IPv4 (or domain), destination port, and protocol (`tcp`, `udp`, or `both`). **The rule is applied immediately, and the first successful add automatically enables `portfw-nft.service` for future boots.** You do not need to run `systemctl enable --now` manually.
 
-**5. Enable forwarding persistence after verifying the new rule works from an external client:**
-
-```bash
-sudo systemctl enable --now portfw-nft.service
-```
-
-That's it. Open the menu any time with `sudo portfw-nft`.
+That's it. Test connectivity from an external client, and open the menu any time with `sudo portfw-nft`. You can optionally check boot persistence with `systemctl is-enabled portfw-nft.service`. If automatic enable fails, the program warns you; the forwarding rule remains active, but persistence needs attention.
 
 > **Already running the old `portfw` / iptables version?** Don't perform the fresh-install activation on top of it. Use the [upgrade and migration instructions](#moving-from-legacy-iptables-v110) near the end of this README.
 
@@ -149,7 +143,7 @@ Menu options **7** and **8** provide the same timer configuration/manual refresh
 
 The native service `portfw-nft.service` restores the managed rules at boot, after network-online. State is stored in `/etc/iptables-forward-manager/rules.db`; domain cache in `/etc/iptables-forward-manager/dns-cache.db`.
 
-For a fresh native installation, the installer deliberately **doesn't start or enable** the service. The Quick Start instructions show how to enable it after a verified rule. If the **primary IPv4 changes**, run `sudo portfw-nft reload` to update the SNAT source. Secondary/floating IPv4s are matched when the kernel considers them local.
+For a fresh native installation, the installer deliberately **doesn't start or enable** the service. After the **first successful Add Forwarding**, the program enables boot restoration automatically using `systemctl enable portfw-nft.service` (without reapplying the active kernel rules). If this step fails, it prints a warning; check `systemctl is-enabled portfw-nft.service` and the service permissions. If the **primary IPv4 changes**, run `sudo portfw-nft reload` to update the SNAT source. Secondary/floating IPv4s are matched when the kernel considers them local.
 
 Read-only checks:
 

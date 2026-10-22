@@ -2,6 +2,20 @@
 
 ## Native nftables v2 candidate (staging)
 
+### Native terminal interface (v2.0.0-rc2)
+
+After the controlled migration to native nftables, open the colorful **native** manager with:
+
+```bash
+sudo portfw-nft
+```
+
+The native interactive interface uses the same styling conventions as the legacy v1.1.0 menu: a color-coded title, a bordered server-information panel, hostname, network interface, primary IPv4, floating/secondary IPv4, global IPv6 addresses and count of saved managed rules, plus color-coded Add/Edit/Delete/List/Reload menu options. Native-only options for DNS settings and manual DNS refresh are retained. Long comma-separated port specifications are wrapped instead of truncated. Add/Edit preserve field prompts, default values and validation.
+
+**Important:** `portfw` still launches the **legacy iptables 1.1.0 tool**, not the native tool. On migrated servers use **`portfw-nft`**, never legacy `portfw --reload`, which could reattach old NAT rules. UI changes only affect terminal presentation; the nftables ruleset, systemd timer state and forwarding behavior are unchanged when the menu is displayed.
+
+A native UI-only upgrade may be installed using `install-native.sh` from the approved development branch; installing does **not** restart the enabled native service, flush nftables or enable DNS refresh. Check `portfw-nft --version` and `portfw-nft list` afterwards.
+
 A feature branch contains the next-generation **native nftables** engine with ordered single/range/comma-list port forwarding, IPv4 or domain destinations, a separate DNS refresh service/timer (5-minute default), and a `quality` CI workflow.
 
 **This is opt-in and does not replace the production `portfw` executable.** Install the candidate side by side, review the controlled cutover, and test it on a non-production host before any merge or deployment.

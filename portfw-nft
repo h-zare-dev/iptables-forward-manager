@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Native nftables forwarding engine. Opt-in sidecar: never auto-replaces legacy rules."""
 import argparse
+import socket
+import textwrap
 import contextlib
 import fcntl
 import ipaddress
@@ -12,7 +14,7 @@ import subprocess
 import sys
 import tempfile
 
-VERSION = "2.0.0-rc1"
+VERSION = "2.0.0-rc2"
 STATE_DIR = Path(os.environ.get("PORTFW_STATE_DIR", "/etc/iptables-forward-manager"))
 RULES = STATE_DIR / "rules.db"
 CACHE = STATE_DIR / "dns-cache.db"
@@ -383,52 +385,368 @@ def configure_timer(minutes=None, enable=None):
     print("DNS timer settings updated")
 
 
+# Terminal UI deliberately separate from the data-plane / nftables engine.
+# Non-interactive commands and root-owned state keep their original behavior.
+ANSI = {
+    "red": "31", "green": "32", "yellow": "33", "blue": "34",
+    "magenta": "35", "cyan": "36", "white": "37", "dim": "2",
+    "bold": "1",
+}
+PANEL_WIDTH = 64
+
+
+def _has_color():
+    return sys.stdout.isatty() and os.environ.get("TERM", "") != "dumb" and "NO_COLOR" not in os.environ
+
+
+def _paint(value, color):
+    text = str(value)
+    return f"\033[{ANSI[color]}m{text}\033[0m" if _has_color() else text
+
+
+def _screen():
+    if sys.stdout.isatty() and os.environ.get("TERM", "") != "dumb":
+        print("\033[2J\033[H", end="")
+
+
+def _panel_border(left, mid, right):
+    print(_paint(left + mid * (PANEL_WIDTH + 2) + right, "cyan"))
+
+
+def _panel_row(label, value, color="white"):
+    # Wrap long Floating IP lists rather than truncate an address.
+    name = f"{label}:"
+    available = max(8, PANEL_WIDTH - len(name) - 2)
+    segments = textwrap.wrap(
+        str(value), width=available, break_long_words=True,
+        break_on_hyphens=False
+    ) or [""]
+    for idx, segment in enumerate(segments):
+        prefix = name if idx == 0 else " " * len(name)
+        plain = f"{prefix} {segment}"
+        padding = " " * max(0, PANEL_WIDTH - len(plain))
+        print(
+            _paint("│", "cyan") + " "
+            + _paint(prefix, "yellow") + " " + _paint(segment, color)
+            + padding + " " + _paint("│", "cyan")
+        )
+
+
+def _ip_command(*args):
+    # Information-only commands; failure must never alter the firewall.
+    try:
+        return run(["ip", *args], timeout=3).stdout
+    except PortfwError:
+        return ""
+
+
+def _interface():
+    route = _ip_command("-4", "route", "show", "default")
+    for line in route.splitlines():
+        parts = line.split()
+        if "dev" in parts:
+            index = parts.index("dev")
+            if index + 1 < len(parts):
+                return parts[index + 1]
+    return ""
+
+
+def _interface_addresses(interface, family):
+    if not interface:
+        return []
+    output = _ip_command(f"-{family}", "-o", "addr", "show", "dev", interface, "scope", "global")
+    addresses = []
+    marker = "inet" if family == 4 else "inet6"
+    for line in output.splitlines():
+        parts = line.split()
+        if marker in parts:
+            index = parts.index(marker)
+            if index + 1 < len(parts):
+                ip = parts[index + 1].split("/", 1)[0]
+                if ip not in addresses:
+                    addresses.append(ip)
+    return addresses
+
+
+def _server_info(records=None):
+    hostname = socket.gethostname()
+    interface = _interface()
+    try:
+        primary = primary_ipv4()
+    except PortfwError:
+        primary = "N/A"
+    v4 = [address for address in _interface_addresses(interface, 4) if address != primary]
+    v6 = _interface_addresses(interface, 6)
+    return {
+        "host": hostname, "interface": interface or "N/A", "primary": primary,
+        "other_ipv4": ", ".join(v4) if v4 else "None",
+        "ipv6": ", ".join(v6) if v6 else "None",
+        "count": len(read_rules() if records is None else records),
+    }
+
+
+def print_header(records=None):
+    _screen()
+    print(_paint("Port Forward Manager", "cyan") + _paint("  |  ", "dim")
+          + _paint(f"Native nftables v{VERSION}", "yellow"))
+    print(_paint("Persistent IPv4 forwarding with managed nftables maps and sets.", "dim"))
+    print()
+    info = _server_info(records)
+    _panel_border("┌", "─", "┐")
+    _panel_row("Host", info["host"])
+    _panel_row("Interface", info["interface"])
+    _panel_row("Primary IPv4", info["primary"], "green")
+    _panel_row("Other IPv4", info["other_ipv4"], "white")
+    _panel_row("IPv6", info["ipv6"], "white")
+    _panel_row("Managed rules", info["count"], "magenta")
+    _panel_border("└", "─", "┘")
+    print()
+
+
+def _menu_item(key, label, description, color):
+    print(_paint(f"[{key}] ", "bold") + _paint(f"{label:<20}", color)
+          + " " + _paint(description, "dim"))
+
+
+def _heading(label, subtitle, color="cyan"):
+    print()
+    print(_paint(label, color) + "  " + _paint(subtitle, "dim"))
+    print(_paint("─" * 62, "dim"))
+
+
+def _prompt(label, default=None, color="cyan"):
+    suffix = f" [{default}]" if default is not None else ""
+    answer = input(_paint(label, color) + _paint(suffix, "dim") + ": ").strip()
+    return answer if answer else (default if default is not None else "")
+
+
+def _pause():
+    input("\n" + _paint("Press Enter to continue...", "dim"))
+
+
+def _rule_columns(records):
+    headers = ("ID", "Source Port(s)", "Destination IP / Domain", "Destination Port(s)", "Protocol")
+    values = [(str(r[0]), r[1], r[2], r[3],
+               "TCP+UDP" if r[4] == "both" else r[4].upper()) for r in records]
+    minimum = (3, 14, 23, 19, 8)
+    maximum = (5, 24, 36, 24, 9)
+    widths = [min(max(minimum[i], len(headers[i]),
+                      max((len(str(row[i])) for row in values), default=0)), maximum[i])
+              for i in range(len(headers))]
+    return headers, values, widths
+
+
 def list_rules(records):
-    print(f"{'ID':<5} {'Source':<23} {'Destination IPv4 / Domain':<38} {'Port(s)':<23} Protocol")
-    for id_, source, target, dest, proto in records:
-        print(f"{id_:<5} {source:<23} {target:<38} {dest:<23} {proto}")
+    headers, rows, widths = _rule_columns(records)
+    print()
+    print(_paint("Managed Forwarding Rules", "cyan"))
+    def cells(values):
+        return "  ".join(str(value).ljust(width) for value, width in zip(values, widths))
+    print(_paint(cells(headers), "cyan"))
+    print(_paint(cells(["─" * width for width in widths]), "dim"))
+    colors = ("white", "green", "blue", "magenta", "yellow")
+    for row in rows:
+        wrapped = [textwrap.wrap(str(value), width=width,
+                    break_long_words=True, break_on_hyphens=False) or [""]
+                   for value, width in zip(row, widths)]
+        for index in range(max(map(len, wrapped))):
+            values = [chunks[index] if index < len(chunks) else "" for chunks in wrapped]
+            print("  ".join(
+                _paint(value.ljust(width), color)
+                for value, width, color in zip(values, widths, colors)
+            ))
+    if not rows:
+        print(_paint("No forwarding rules configured.", "dim"))
+    print()
+
+
+def _entry(existing=None):
+    defaults = existing or ("", "", "", "both")
+    for i, (field, color) in enumerate((
+        ("Source port(s) — e.g. 2001-2005,2010", "green"),
+        ("Destination IPv4 or domain", "blue"),
+        ("Destination port(s) — one-to-one mapping", "magenta"),
+        ("Protocol (tcp/udp/both)", "yellow"),
+    )):
+        # The inner prompts loop to handle invalid data without discarding earlier entries.
+        while True:
+            value = _prompt(field, defaults[i] if (existing or i == 3) else None, color)
+            try:
+                if i in (0, 2):
+                    ports(value)
+                elif i == 1:
+                    destination(value)
+                elif value not in PROTOCOLS:
+                    raise PortfwError("Choose tcp, udp or both")
+                break
+            except PortfwError as exc:
+                print(_paint(f"Invalid value: {exc}", "red"))
+        if i == 0:
+            source = value
+        elif i == 1:
+            target = value
+        elif i == 2:
+            dest = value
+        else:
+            proto = value.lower()
+    # Ensure malformed cardinality or overlapping ports fail before the apply operation.
+    make_rule(1, source, target, dest, proto)
+    return source, target, dest, proto
+
+
+def _add():
+    _heading("Add Forwarding", "Create an IPv4 destination with single/range/list ports", "green")
+    source, target, dest, proto = _entry()
+    change("add", argparse.Namespace(source=source, target=target, dest=dest, protocol=proto))
+    print(_paint("✓ Rule added successfully.", "green"))
+
+
+def _choose_id(records, action):
+    if not records:
+        raise PortfwError("No forwarding rules configured")
+    list_rules(records)
+    raw = _prompt(f"Select rule ID to {action}", color="yellow")
+    if not raw.isdigit() or int(raw) not in {rule[0] for rule in records}:
+        raise PortfwError("Rule ID not found")
+    return int(raw)
+
+
+def _edit():
+    _heading("Edit Forwarding", "Press Enter to keep each existing value", "yellow")
+    records = read_rules()
+    id_ = _choose_id(records, "edit")
+    selected = next(row for row in records if row[0] == id_)
+    source, target, dest, proto = _entry((selected[1], selected[2], selected[3], selected[4]))
+    change("edit", argparse.Namespace(id=id_, source=source, target=target, dest=dest, protocol=proto))
+    print(_paint(f"✓ Rule {id_} updated.", "green"))
+
+
+def _delete():
+    _heading("Delete Forwarding", "Remove one managed entry", "red")
+    id_ = _choose_id(read_rules(), "delete")
+    if _prompt(f"Delete rule {id_}? (y/N)", color="red").lower() != "y":
+        print(_paint("Cancelled. No changes made.", "yellow"))
+        return
+    change("delete", argparse.Namespace(id=id_))
+    print(_paint(f"✓ Rule {id_} removed.", "green"))
+
+
+def _delete_all():
+    _heading("Delete All", "Remove only Port Forward Manager rules", "red")
+    list_rules(read_rules())
+    if _prompt("Type DELETE to confirm", color="red") != "DELETE":
+        print(_paint("Cancelled. No changes made.", "yellow"))
+        return
+    change("clear", argparse.Namespace())
+    print(_paint("✓ Managed rules cleared.", "green"))
+
+
+def _dns_configured_minutes():
+    override = "/etc/systemd/system/portfw-dns-refresh.timer.d/override.conf"
+    try:
+        text = Path(override).read_text()
+    except OSError:
+        return 5
+    for line in reversed(text.splitlines()):
+        match = re.fullmatch(r"\s*OnUnitInactiveSec\s*=\s*(\d+)min\s*", line)
+        if match:
+            return int(match.group(1))
+    return 5
+
+
+def _dns_is_enabled():
+    try:
+        result = run(["systemctl", "is-enabled", "portfw-dns-refresh.timer"],
+                     timeout=3, check=False)
+    except PortfwError:
+        return False
+    return result.stdout.strip() == "enabled"
+
+
+def _dns_settings():
+    while True:
+        _heading("DNS Auto Refresh", "Separate systemd timer; forwarding remains in kernel", "cyan")
+        interval = _dns_configured_minutes()
+        enabled = _dns_is_enabled()
+        print("Status: " + _paint("Enabled" if enabled else "Disabled", "green" if enabled else "yellow"))
+        print(f"Interval: {_paint(str(interval) + ' minutes', 'cyan')}")
+        print()
+        _menu_item("1", "Change Interval", "1/2/3/5/10/15/20/30/45/60 min", "cyan")
+        _menu_item("2", "Enable Timer", "Start periodic DNS checks", "green")
+        _menu_item("3", "Disable Timer", "Keep current forwarding rules", "red")
+        _menu_item("0", "Back", "Return to main menu", "white")
+        choice = _prompt("Select option", color="white")
+        if choice == "0":
+            return
+        try:
+            if choice == "1":
+                selected = _prompt("Interval in minutes", str(interval), "cyan")
+                if not selected.isdigit() or int(selected) not in INTERVALS:
+                    raise PortfwError(f"Allowed intervals: {', '.join(map(str, INTERVALS))}")
+                configure_timer(int(selected), None)
+            elif choice == "2":
+                configure_timer(None, True)
+            elif choice == "3":
+                configure_timer(None, False)
+            else:
+                print(_paint("Invalid menu option.", "red"))
+        except PortfwError as exc:
+            print(_paint(f"ERROR: {exc}", "red"))
 
 
 def interactive():
     while True:
-        print("\nPort Forward Manager native nftables", VERSION)
-        print("1) Add  2) Edit  3) Delete  4) List  5) Delete all  6) Reload  7) DNS settings  8) DNS refresh  0) Exit")
-        choice = input("Select: ").strip()
         try:
-            if choice in ("1", "2"):
-                args = argparse.Namespace()
-                args.id = int(input("Rule ID: ")) if choice == "2" else None
-                args.source = input("Source port(s), e.g. 2001-2010,2020: ").strip()
-                args.target = input("Destination IPv4 or hostname: ").strip()
-                args.dest = input("Destination port(s): ").strip()
-                args.protocol = input("Protocol tcp/udp/both [both]: ").strip().lower() or "both"
-                change("edit" if choice == "2" else "add", args)
+            records = read_rules()
+            print_header(records)
+            _menu_item("1", "Add Forwarding", "Create a new forwarding rule", "green")
+            _menu_item("2", "Edit Forwarding", "Modify an existing rule", "yellow")
+            _menu_item("3", "Delete Forwarding", "Remove one managed rule", "red")
+            _menu_item("4", "List Forwarding", "Show all managed rules", "cyan")
+            _menu_item("5", "Delete All", "Remove all managed forwarding rules", "red")
+            _menu_item("6", "Reload Rules", "Reapply native maps and re-detect Primary IP", "magenta")
+            _menu_item("7", "DNS Auto Refresh", "Configure background refresh timer", "blue")
+            _menu_item("8", "Refresh DNS Now", "Manually resolve domain destinations", "cyan")
+            _menu_item("0", "Exit", "Close the manager", "white")
+            print()
+            choice = _prompt("Select option", color="white")
+            if choice == "0":
+                return
+            if choice == "1":
+                _add()
+            elif choice == "2":
+                _edit()
             elif choice == "3":
-                change("delete", argparse.Namespace(id=int(input("Rule ID: "))))
+                _delete()
             elif choice == "4":
-                list_rules(read_rules())
+                list_rules(records)
             elif choice == "5":
-                if input("Type DELETE to confirm: ") == "DELETE":
-                    change("clear", argparse.Namespace())
+                _delete_all()
             elif choice == "6":
+                _heading("Reload Rules", "Rebuilding the managed native nftables table", "magenta")
                 with locked():
                     apply(read_rules(), read_cache())
-                print("Reload complete")
+                print(_paint("✓ Native forwarding rules reloaded.", "green"))
             elif choice == "7":
-                print("Intervals (minutes):", ", ".join(map(str, INTERVALS)))
-                minutes = int(input("Interval in minutes [5]: ") or "5")
-                mode = input("Enable, disable or keep? [enable/disable/keep]: ").strip()
-                if mode not in ("enable", "disable", "keep"):
-                    raise PortfwError("Invalid timer mode")
-                configure_timer(minutes, None if mode == "keep" else mode == "enable")
+                _dns_settings()
             elif choice == "8":
+                _heading("Refresh DNS Now", "Check configured domains and update only if changed", "cyan")
                 refresh_dns()
-            elif choice == "0":
-                return
+                print(_paint("✓ DNS refresh completed.", "green"))
             else:
-                print("Invalid option")
-        except (PortfwError, ValueError, EOFError) as exc:
-            print(f"ERROR: {exc}", file=sys.stderr)
+                print(_paint("Invalid menu option.", "red"))
+            if choice != "7":
+                _pause()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        except (PortfwError, ValueError, OSError) as exc:
+            print(_paint(f"ERROR: {exc}", "red"), file=sys.stderr)
+            try:
+                _pause()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return
 
 
 def main():

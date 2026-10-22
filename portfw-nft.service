@@ -1,0 +1,14 @@
+[Unit]
+Description=Port Forward Manager - native nftables rule restore
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/portfw-nft apply
+ExecReload=/usr/local/bin/portfw-nft reload
+RemainAfterExit=yes
+TimeoutStartSec=40s
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,50 @@
+name: Quality
+
+on:
+  push:
+    branches: [development, main, 'feature/**']
+  pull_request:
+    branches: [development, main]
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: quality
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Bash syntax
+        run: bash -n portfw install.sh install-native.sh
+      - name: Python syntax
+        run: python3 -m py_compile portfw-nft tests/test_native.py
+      - name: Native forwarding unit tests
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+      - name: nftables dry-run (no firewall mutations)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq nftables
+          tempdir="$(mktemp -d)"
+          trap 'rm -rf "$tempdir"' EXIT
+          printf '1|2001-2003,2010|192.0.2.50|3001-3003,8080|both\n2|5001|edge.example.net|6001|tcp\n' > "$tempdir/rules.db"
+          printf 'edge.example.net|198.51.100.7\n' > "$tempdir/dns-cache.db"
+          PORTFW_STATE_DIR="$tempdir" python3 portfw-nft render > "$tempdir/rules.nft"
+          sudo nft -c -f "$tempdir/rules.nft"
+      - name: Native nftables atomic replacement (isolated network namespace)
+        run: |
+          tempdir="$(mktemp -d)"
+          ns="portfw-ci-$RANDOM"
+          trap 'sudo ip netns del "$ns" 2>/dev/null || true; rm -rf "$tempdir"' EXIT
+          sudo ip netns add "$ns"
+          printf '1|2001-2003|192.0.2.50|3001-3003|tcp\n' > "$tempdir/rules.db"
+          PORTFW_STATE_DIR="$tempdir" python3 portfw-nft render > "$tempdir/initial.nft"
+          sudo ip netns exec "$ns" nft -f "$tempdir/initial.nft"
+          printf '1|2001-2003|198.51.100.7|4001-4003|tcp\n' > "$tempdir/rules.db"
+          echo 'delete table ip ifm_portfw' > "$tempdir/replace.nft"
+          PORTFW_STATE_DIR="$tempdir" python3 portfw-nft render >> "$tempdir/replace.nft"
+          sudo ip netns exec "$ns" nft -c -f "$tempdir/replace.nft"
+          sudo ip netns exec "$ns" nft -f "$tempdir/replace.nft"
+          sudo ip netns exec "$ns" nft list table ip ifm_portfw | grep -q '198.51.100.7'

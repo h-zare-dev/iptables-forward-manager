@@ -1,0 +1,11 @@
+[Unit]
+Description=Port Forward Manager - domain IP refresh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/portfw-nft dns-refresh
+TimeoutStartSec=90s
+Nice=10
+IOSchedulingClass=idle

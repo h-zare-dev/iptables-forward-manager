@@ -1,0 +1,488 @@
+#!/usr/bin/env python3
+"""Native nftables forwarding engine. Opt-in sidecar: never auto-replaces legacy rules."""
+import argparse
+import contextlib
+import fcntl
+import ipaddress
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+VERSION = "2.0.0-rc1"
+STATE_DIR = Path(os.environ.get("PORTFW_STATE_DIR", "/etc/iptables-forward-manager"))
+RULES = STATE_DIR / "rules.db"
+CACHE = STATE_DIR / "dns-cache.db"
+LOCK = Path(os.environ.get("PORTFW_LOCK", "/run/iptables-forward-manager.lock"))
+TABLE = "ifm_portfw"
+INTERVALS = (1, 2, 3, 5, 10, 15, 20, 30, 45, 60)
+MAX_PORTS_PER_RULE = 4096
+MAX_PORTS_TOTAL = 10000
+DNS_RE = re.compile(r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+PROTOCOLS = {"tcp": ("tcp",), "udp": ("udp",), "both": ("tcp", "udp")}
+
+
+class PortfwError(Exception):
+    pass
+
+
+def run(cmd, *, input=None, timeout=20, check=True):
+    try:
+        p = subprocess.run(cmd, input=input, text=True, capture_output=True, timeout=timeout, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise PortfwError(f"Cannot execute {cmd[0]}: {exc}") from exc
+    if check and p.returncode:
+        raise PortfwError(f"{' '.join(cmd)} failed: {p.stderr.strip() or p.stdout.strip()}")
+    return p
+
+
+def ipv4(value):
+    try:
+        addr = ipaddress.IPv4Address(value)
+    except ipaddress.AddressValueError:
+        raise PortfwError(f"Invalid IPv4 address: {value}") from None
+    if addr.is_multicast or addr.is_unspecified or addr.is_loopback:
+        raise PortfwError(f"Unsafe destination IPv4 address: {value}")
+    return str(addr)
+
+
+def destination(value):
+    try:
+        return ipv4(value)
+    except PortfwError:
+        # An IP-like value must not slip through as a hostname.
+        if re.fullmatch(r"[0-9.]+", value):
+            raise
+    value = value.rstrip(".").lower()
+    if not DNS_RE.fullmatch(value):
+        raise PortfwError(f"Invalid destination hostname: {value}")
+    return value
+
+
+def is_domain(value):
+    return not re.fullmatch(r"[0-9.]+", value)
+
+
+def ports(value):
+    """Expand ordered comma lists and inclusive ranges; reject duplicates and malformed tokens."""
+    if not value or not re.fullmatch(r"[0-9,\- ]+", value):
+        raise PortfwError(f"Invalid port specification: {value!r}")
+    result = []
+    for raw in value.split(","):
+        token = raw.strip()
+        if not token:
+            raise PortfwError("Empty port list item")
+        parts = [p.strip() for p in token.split("-")]
+        if len(parts) not in (1, 2) or not all(re.fullmatch(r"[0-9]+", p) for p in parts):
+            raise PortfwError(f"Invalid port item: {token!r}")
+        values = list(map(int, parts))
+        if any(n < 1 or n > 65535 for n in values):
+            raise PortfwError("Ports must be between 1 and 65535")
+        if len(values) == 2 and values[0] > values[1]:
+            raise PortfwError(f"Descending range: {token}")
+        result.extend(range(values[0], values[-1] + 1))
+        if len(result) > MAX_PORTS_PER_RULE:
+            raise PortfwError(f"More than {MAX_PORTS_PER_RULE} ports per rule")
+    if len(set(result)) != len(result):
+        raise PortfwError("Duplicate ports in the same specification")
+    return result
+
+
+def make_rule(id_, source, target, dest, proto):
+    if not str(id_).isdigit() or int(id_) <= 0:
+        raise PortfwError("Invalid rule ID")
+    source_ports, dest_ports = ports(source), ports(dest)
+    if len(source_ports) != len(dest_ports):
+        raise PortfwError(f"Source has {len(source_ports)} ports; destination has {len(dest_ports)}. Counts must match.")
+    if proto not in PROTOCOLS:
+        raise PortfwError("Protocol must be tcp, udp, or both")
+    return (int(id_), source, destination(target), dest, proto)
+
+
+def validate_rules(records):
+    ids, occupied = set(), set()
+    total = 0
+    for rec in records:
+        rule = make_rule(*rec)
+        id_, source, _, dest, proto = rule
+        if id_ in ids:
+            raise PortfwError(f"Duplicate rule ID: {id_}")
+        ids.add(id_)
+        count = len(ports(source))
+        total += count * len(PROTOCOLS[proto])
+        if total > MAX_PORTS_TOTAL:
+            raise PortfwError(f"More than {MAX_PORTS_TOTAL} protocol/port mappings in total")
+        for p in PROTOCOLS[proto]:
+            for n in ports(source):
+                k = (p, n)
+                if k in occupied:
+                    raise PortfwError(f"Source conflict on {p}/{n}")
+                occupied.add(k)
+    return records
+
+
+def read_rules():
+    if not RULES.exists():
+        return []
+    result = []
+    for line_no, line in enumerate(RULES.read_text().splitlines(), 1):
+        if not line.strip():
+            continue
+        fields = line.split("|")
+        if len(fields) != 5:
+            raise PortfwError(f"Malformed state at line {line_no}")
+        try:
+            result.append(make_rule(*fields))
+        except PortfwError as exc:
+            raise PortfwError(f"State line {line_no}: {exc}") from exc
+    return validate_rules(result)
+
+
+def write_atomic(path, content):
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=".portfw-", dir=str(path.parent))
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as out:
+            out.write(content)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def save_rules(records):
+    write_atomic(RULES, "".join("|".join(map(str, rec)) + "\n" for rec in records))
+
+
+def read_cache():
+    if not CACHE.exists():
+        return {}
+    result = {}
+    for line in CACHE.read_text().splitlines():
+        parts = line.split("|")
+        if len(parts) != 2:
+            raise PortfwError("Malformed DNS cache")
+        host, address = parts
+        if not is_domain(destination(host)):
+            raise PortfwError("Invalid host in DNS cache")
+        result[host] = ipv4(address)
+    return result
+
+
+def save_cache(cache):
+    write_atomic(CACHE, "".join(f"{k}|{v}\n" for k, v in sorted(cache.items())))
+
+
+@contextlib.contextmanager
+def locked():
+    LOCK.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK.open("a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+
+
+def resolve(host):
+    # A bounded, system-resolver lookup. No shell interpolation, no DNS in packet path.
+    result = run(["getent", "ahostsv4", host], timeout=5)
+    addresses = set()
+    for line in result.stdout.splitlines():
+        item = line.split()[0] if line.split() else ""
+        try:
+            addresses.add(ipv4(item))
+        except PortfwError:
+            continue
+    if not addresses:
+        raise PortfwError(f"No usable IPv4 A record for {host}")
+    return sorted(addresses, key=lambda a: int(ipaddress.IPv4Address(a)))[0]
+
+
+def primary_ipv4():
+    result = run(["ip", "-4", "route", "get", "1.1.1.1"], timeout=5)
+    match = re.search(r"\bsrc\s+(\d+\.\d+\.\d+\.\d+)", result.stdout)
+    if not match:
+        raise PortfwError("Cannot detect primary IPv4")
+    return ipv4(match.group(1))
+
+
+def legacy_active():
+    if not shutil.which("iptables"):
+        return False
+    p = run(["iptables", "-w", "2", "-t", "nat", "-C", "PREROUTING", "-j", "IFM_DNAT"], check=False, timeout=5)
+    return p.returncode == 0
+
+
+def table_exists():
+    return run(["nft", "list", "table", "ip", TABLE], check=False, timeout=5).returncode == 0
+
+
+def nft_config(records, cache, primary, *, existing=False):
+    """Render ONLY the program-owned table, replace it as one nft transaction."""
+    validate_rules(records)
+    primary = ipv4(primary)
+    maps = {"tcp": [], "udp": []}
+    fw = {"tcp": set(), "udp": set()}
+    snat = {"tcp": set(), "udp": set()}
+    for _, source, target, dest, protocol in records:
+        ip = cache.get(target) if is_domain(target) else target
+        if not ip:
+            raise PortfwError(f"No DNS cache for {target}; run --dns-refresh first")
+        ip = ipv4(ip)
+        for p in PROTOCOLS[protocol]:
+            for s, d in zip(ports(source), ports(dest)):
+                maps[p].append((s, ip, d))
+                fw[p].add((ip, d))
+                snat[p].add((ip, d, s))
+    lines = []
+    if existing:
+        lines.append(f"delete table ip {TABLE}")
+    lines.append(f"add table ip {TABLE}")
+    for proto in ("tcp", "udp"):
+        lines += [
+            f"add map ip {TABLE} {proto}_dnat {{ type inet_service : ipv4_addr . inet_service; }}",
+            f"add set ip {TABLE} {proto}_forward {{ type ipv4_addr . inet_service; }}",
+            f"add set ip {TABLE} {proto}_snat {{ type ipv4_addr . inet_service . inet_service; }}",
+        ]
+        if maps[proto]:
+            values = ", ".join(f"{s} : {ip} . {d}" for s, ip, d in sorted(maps[proto]))
+            lines.append(f"add element ip {TABLE} {proto}_dnat {{ {values} }}")
+            targets = ", ".join(f"{ip} . {d}" for ip, d in sorted(fw[proto]))
+            lines.append(f"add element ip {TABLE} {proto}_forward {{ {targets} }}")
+            origins = ", ".join(f"{ip} . {d} . {s}" for ip, d, s in sorted(snat[proto]))
+            lines.append(f"add element ip {TABLE} {proto}_snat {{ {origins} }}")
+    lines += [
+        f"add chain ip {TABLE} prerouting {{ type nat hook prerouting priority -101; policy accept; }}",
+        f"add chain ip {TABLE} postrouting {{ type nat hook postrouting priority 99; policy accept; }}",
+        f"add chain ip {TABLE} forwarding {{ type filter hook forward priority -5; policy accept; }}",
+        f"add rule ip {TABLE} forwarding ct state established,related accept",
+    ]
+    for proto in ("tcp", "udp"):
+        if not maps[proto]:
+            continue
+        lines += [
+            f"add rule ip {TABLE} prerouting fib daddr type local ip protocol {proto} dnat ip addr . port to {proto} dport map @{proto}_dnat",
+            f"add rule ip {TABLE} forwarding ct status dnat ip protocol {proto} ip daddr . {proto} dport @{proto}_forward accept",
+            f"add rule ip {TABLE} postrouting ct status dnat ip protocol {proto} ip daddr . {proto} dport . ct original proto-dst @{proto}_snat snat to {primary}",
+        ]
+    return "\n".join(lines) + "\n"
+
+
+def apply(records, cache):
+    if legacy_active():
+        raise PortfwError("Legacy IFM_DNAT jump is active. Refusing overlapping NAT. Perform a controlled maintenance migration.")
+    if not shutil.which("nft"):
+        raise PortfwError("nft executable not installed")
+    primary = primary_ipv4()
+    script = nft_config(records, cache, primary, existing=table_exists())
+    # Ensure prerequisites before committing the atomic firewall transaction.
+    run(["sysctl", "-w", "net.ipv4.ip_forward=1"], timeout=5)
+    run(["nft", "-c", "-f", "-"], input=script, timeout=15)
+    run(["nft", "-f", "-"], input=script, timeout=15)
+
+
+def updated_records(action, args, records):
+    records = list(records)
+    if action == "add":
+        new_id = max((r[0] for r in records), default=0) + 1
+        records.append(make_rule(new_id, args.source, args.target, args.dest, args.protocol))
+    elif action == "edit":
+        if not any(r[0] == args.id for r in records):
+            raise PortfwError("Rule ID not found")
+        records = [make_rule(args.id, args.source, args.target, args.dest, args.protocol) if r[0] == args.id else r for r in records]
+    elif action == "delete":
+        if not any(r[0] == args.id for r in records):
+            raise PortfwError("Rule ID not found")
+        records = [r for r in records if r[0] != args.id]
+    elif action == "clear":
+        records = []
+    return validate_rules(records)
+
+
+def change(action, args):
+    with locked():
+        records = read_rules()
+        cache = read_cache()
+        old_cache = dict(cache)
+        proposed = updated_records(action, args, records)
+        new_hosts = {r[2] for r in proposed if is_domain(r[2])}
+        for host in sorted(new_hosts):
+            if host not in cache:
+                cache[host] = resolve(host)
+        # Apply before persisting; a failed nft validation leaves saved state intact.
+        apply(proposed, cache)
+        try:
+            save_rules(proposed)
+            save_cache({k: v for k, v in cache.items() if k in new_hosts})
+        except OSError as exc:
+            # Restore the previous nft transaction and disk state, best effort.
+            try:
+                apply(records, old_cache)
+                save_rules(records)
+                save_cache(old_cache)
+            except (OSError, PortfwError) as rollback_exc:
+                print(f"CRITICAL: persistence rollback failed: {rollback_exc}", file=sys.stderr)
+            raise PortfwError(f"Could not persist change: {exc}") from exc
+    print(f"{action}: OK")
+
+
+def refresh_dns():
+    # DNS resolution happens OUTSIDE the writer lock; only commit is serialized.
+    with locked():
+        records = read_rules()
+        hosts = sorted({r[2] for r in records if is_domain(r[2])})
+        old = read_cache()
+    if not hosts:
+        print("DNS: no domains configured; no firewall changes")
+        return
+    results = {}
+    for host in hosts:
+        try:
+            results[host] = resolve(host)
+        except PortfwError as exc:
+            print(f"DNS warning: {exc}; keeping last known good IP", file=sys.stderr)
+    with locked():
+        records = read_rules()
+        hosts = {r[2] for r in records if is_domain(r[2])}
+        cache = read_cache()
+        for host in hosts:
+            if host in results:
+                cache[host] = results[host]
+        if any(host not in cache for host in hosts):
+            raise PortfwError("At least one domain has no valid resolved address")
+        new_cache = {k: v for k, v in cache.items() if k in hosts}
+        old_active = {k: v for k, v in read_cache().items() if k in hosts}
+        if new_cache == old_active:
+            print("DNS: unchanged; firewall untouched")
+            return
+        apply(records, new_cache)
+        try:
+            save_cache(new_cache)
+        except OSError as exc:
+            try:
+                apply(records, old_active)
+            except PortfwError as rollback_exc:
+                print(f"CRITICAL: DNS rollback failed: {rollback_exc}", file=sys.stderr)
+            raise PortfwError(f"Could not persist DNS cache: {exc}") from exc
+        print("DNS: changes applied atomically")
+
+
+def configure_timer(minutes=None, enable=None):
+    if minutes is not None and minutes not in INTERVALS:
+        raise PortfwError(f"Interval must be one of {INTERVALS}")
+    dropin = Path("/etc/systemd/system/portfw-dns-refresh.timer.d/override.conf")
+    if minutes is not None:
+        write_atomic(dropin, f"[Timer]\nOnUnitInactiveSec=\nOnUnitInactiveSec={minutes}min\nAccuracySec=30s\n")
+        run(["systemctl", "daemon-reload"])
+    if enable is not None:
+        run(["systemctl", "enable" if enable else "disable", "--now", "portfw-dns-refresh.timer"])
+    print("DNS timer settings updated")
+
+
+def list_rules(records):
+    print(f"{'ID':<5} {'Source':<23} {'Destination IPv4 / Domain':<38} {'Port(s)':<23} Protocol")
+    for id_, source, target, dest, proto in records:
+        print(f"{id_:<5} {source:<23} {target:<38} {dest:<23} {proto}")
+
+
+def interactive():
+    while True:
+        print("\nPort Forward Manager native nftables", VERSION)
+        print("1) Add  2) Edit  3) Delete  4) List  5) Delete all  6) Reload  7) DNS settings  8) DNS refresh  0) Exit")
+        choice = input("Select: ").strip()
+        try:
+            if choice in ("1", "2"):
+                args = argparse.Namespace()
+                args.id = int(input("Rule ID: ")) if choice == "2" else None
+                args.source = input("Source port(s), e.g. 2001-2010,2020: ").strip()
+                args.target = input("Destination IPv4 or hostname: ").strip()
+                args.dest = input("Destination port(s): ").strip()
+                args.protocol = input("Protocol tcp/udp/both [both]: ").strip().lower() or "both"
+                change("edit" if choice == "2" else "add", args)
+            elif choice == "3":
+                change("delete", argparse.Namespace(id=int(input("Rule ID: "))))
+            elif choice == "4":
+                list_rules(read_rules())
+            elif choice == "5":
+                if input("Type DELETE to confirm: ") == "DELETE":
+                    change("clear", argparse.Namespace())
+            elif choice == "6":
+                with locked():
+                    apply(read_rules(), read_cache())
+                print("Reload complete")
+            elif choice == "7":
+                print("Intervals (minutes):", ", ".join(map(str, INTERVALS)))
+                minutes = int(input("Interval in minutes [5]: ") or "5")
+                mode = input("Enable, disable or keep? [enable/disable/keep]: ").strip()
+                if mode not in ("enable", "disable", "keep"):
+                    raise PortfwError("Invalid timer mode")
+                configure_timer(minutes, None if mode == "keep" else mode == "enable")
+            elif choice == "8":
+                refresh_dns()
+            elif choice == "0":
+                return
+            else:
+                print("Invalid option")
+        except (PortfwError, ValueError, EOFError) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Native nftables port forwarding (staged opt-in)")
+    parser.add_argument("--version", action="version", version=VERSION)
+    sub = parser.add_subparsers(dest="action")
+    for action in ("add", "edit"):
+        p = sub.add_parser(action)
+        if action == "edit":
+            p.add_argument("id", type=int)
+        p.add_argument("source")
+        p.add_argument("target")
+        p.add_argument("dest")
+        p.add_argument("protocol", choices=list(PROTOCOLS))
+    for action in ("delete",):
+        sub.add_parser(action).add_argument("id", type=int)
+    for action in ("clear", "list", "apply", "reload", "dns-refresh", "render", "check"):
+        sub.add_parser(action)
+    timer = sub.add_parser("timer")
+    timer.add_argument("--minutes", type=int, choices=INTERVALS)
+    group = timer.add_mutually_exclusive_group()
+    group.add_argument("--enable", action="store_true")
+    group.add_argument("--disable", action="store_true")
+    args = parser.parse_args()
+    try:
+        if args.action in ("list", "render", "check"):
+            records = read_rules()
+            if args.action == "list":
+                list_rules(records)
+            elif args.action == "render":
+                print(nft_config(records, read_cache(), "192.0.2.1", existing=False))
+            else:
+                print("State validation OK")
+            return
+        if os.geteuid() != 0:
+            raise PortfwError("Root is required for modifying firewall/state")
+        if args.action in ("add", "edit", "delete", "clear"):
+            change(args.action, args)
+        elif args.action in ("apply", "reload"):
+            with locked():
+                apply(read_rules(), read_cache())
+            print("Rules applied")
+        elif args.action == "dns-refresh":
+            refresh_dns()
+        elif args.action == "timer":
+            configure_timer(args.minutes, True if args.enable else False if args.disable else None)
+        elif args.action is None:
+            interactive()
+        else:
+            parser.error("unknown action")
+    except PortfwError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        raise SystemExit(1) from None
+
+
+if __name__ == "__main__":
+    main()

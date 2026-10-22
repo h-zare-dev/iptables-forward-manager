@@ -1,5 +1,13 @@
 # iptables-forward-manager
 
+## Native nftables v2 candidate (staging)
+
+A feature branch contains the next-generation **native nftables** engine with ordered single/range/comma-list port forwarding, IPv4 or domain destinations, a separate DNS refresh service/timer (5-minute default), and a `quality` CI workflow.
+
+**This is opt-in and does not replace the production `portfw` executable.** Install the candidate side by side, review the controlled cutover, and test it on a non-production host before any merge or deployment.
+
+See [Native nftables candidate: setup, safety, limitations and tests](docs/NATIVE_NFT_CANDIDATE.md).
+
 A small interactive manager for persistent IPv4 port forwarding with `iptables`.
 
 The goal is simple: users manage **ports and destination IPs**, not raw firewall commands.

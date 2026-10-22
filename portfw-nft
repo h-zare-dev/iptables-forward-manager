@@ -432,6 +432,26 @@ def _panel_row(label, value, color="white"):
         )
 
 
+def _panel_host_interface(host, interface):
+    # Keep the two fields on the same first line like the legacy v1.1 dashboard.
+    first = f"Host: {host}"
+    second = f"Interface: {interface}"
+    gap_size = max(3, 31 - len(first))
+    plain = first + " " * gap_size + second
+    if len(plain) > PANEL_WIDTH:
+        _panel_row("Host", host)
+        _panel_row("Interface", interface)
+        return
+    pad = " " * (PANEL_WIDTH - len(plain))
+    print(
+        _paint("│", "cyan") + " "
+        + _paint("Host:", "yellow") + " " + str(host)
+        + " " * gap_size
+        + _paint("Interface:", "yellow") + " " + str(interface)
+        + pad + " " + _paint("│", "cyan")
+    )
+
+
 def _ip_command(*args):
     # Information-only commands; failure must never alter the firewall.
     try:
@@ -493,8 +513,7 @@ def print_header(records=None):
     print()
     info = _server_info(records)
     _panel_border("┌", "─", "┐")
-    _panel_row("Host", info["host"])
-    _panel_row("Interface", info["interface"])
+    _panel_host_interface(info["host"], info["interface"])
     _panel_row("Primary IPv4", info["primary"], "green")
     _panel_row("Other IPv4", info["other_ipv4"], "white")
     _panel_row("IPv6", info["ipv6"], "white")

@@ -166,6 +166,8 @@ This repository uses **`development` as the default branch**. The normal flow is
 
 GitHub Actions **Quality** and **Shell syntax** cover parsing and invalid cases, UI, migration ordering, DNS-cache behavior, nftables dry runs, and real TCP/UDP forwarding + SNAT in isolated network namespaces. Manual `test-de` testing included migration, native maps, range/list creation and validation. These do **not** certify every firewall setup, low jitter under all loads, or zero-packet-loss cutovers.
 
+For required pre-merge checks, supported runner environments, branch-protection setup and manual release qualifications, see [CI & Release Qualification Gate](docs/CI_RELEASE_GATE.md).
+
 For implementation and compatibility details, see [Native engine technical reference](docs/NATIVE_NFT_CANDIDATE.md).
 
 ## Updating an existing native installation

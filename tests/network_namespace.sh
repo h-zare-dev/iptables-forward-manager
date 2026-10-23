@@ -79,7 +79,7 @@ chmod 600 "$STATE/rules.db" "$STATE/dns-cache.db"
 
 ip netns exec "$NSD" python3 "$ROOT/tests/echo_probe.py" server "$TMP/ready" >"$TMP/server.log" 2>&1 &
 SERVER_PID="$!"
-for i in {1..50}; do
+for _ in {1..50}; do
   [[ -f "$TMP/ready" ]] && break
   if ! kill -0 "$SERVER_PID" 2>/dev/null; then
     cat "$TMP/server.log" >&2; exit 1

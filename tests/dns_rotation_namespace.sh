@@ -59,7 +59,7 @@ chmod 700 "$TMP/bin/getent"
 
 ip netns exec "$NSD" python3 "$ROOT/tests/dns_probe.py" server "$TMP/ready" > "$TMP/server.log" 2>&1 &
 SERVER_PID="$!"
-for i in {1..50}; do
+for _ in {1..50}; do
   [[ -f "$TMP/ready" ]] && break
   kill -0 "$SERVER_PID" 2>/dev/null || { cat "$TMP/server.log"; exit 1; }
   sleep .1

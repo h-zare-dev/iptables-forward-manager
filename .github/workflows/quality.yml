@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 12
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Whitespace and patch validation
         run: git diff --check
       - name: Shell and Python syntax
@@ -49,7 +49,7 @@ jobs:
       matrix:
         os: [ubuntu-22.04, ubuntu-24.04]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install test dependencies
         run: |
           sudo apt-get update -qq
@@ -69,7 +69,7 @@ jobs:
       - name: DNS A-record rotation and fallback in isolated kernel network
         run: sudo bash tests/dns_rotation_namespace.sh
       - name: Concurrent writers and failed applies do not corrupt state
-        run: python3 tests/concurrent_cli.py
+        run: sudo python3 tests/concurrent_cli.py
       - name: Atomic table replacement inside isolated network namespace
         run: |
           tmp="$(mktemp -d)"
@@ -95,7 +95,7 @@ jobs:
       matrix:
         release: [bookworm, trixie]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Unit, installer and service contract smoke tests in disposable Debian
         run: |
           docker run --rm \

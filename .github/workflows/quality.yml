@@ -2,51 +2,127 @@ name: Quality
 
 on:
   push:
-    branches: [development, main, 'feature/**']
+    branches: [development, main, 'feature/**', 'docs/**']
   pull_request:
     branches: [development, main]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: quality-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  quality:
-    name: quality
+  static:
+    name: Static checks
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 12
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Bash syntax
-        run: bash -n portfw install.sh install-native.sh tests/network_namespace.sh
-      - name: Python syntax
-        run: python3 -m py_compile portfw-nft portfw-migrate tests/test_native.py tests/test_migrate.py
-      - name: Native forwarding unit tests
-        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
-      - name: nftables dry-run (no firewall mutations)
+      - uses: actions/checkout@v4
+      - name: Whitespace and patch validation
+        run: git diff --check
+      - name: Shell and Python syntax
+        run: |
+          bash -n portfw install.sh install-native.sh tests/network_namespace.sh tests/dns_rotation_namespace.sh tests/ci_install_smoke.sh
+          python3 -m py_compile portfw-nft portfw-migrate tests/*.py
+      - name: ShellCheck
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq nftables
-          tempdir="$(mktemp -d)"
-          trap 'rm -rf "$tempdir"' EXIT
-          printf '1|2001-2003,2010|192.0.2.50|3001-3003,8080|both\n2|5001|edge.example.net|6001|tcp\n' > "$tempdir/rules.db"
-          printf 'edge.example.net|198.51.100.7\n' > "$tempdir/dns-cache.db"
-          PORTFW_STATE_DIR="$tempdir" python3 portfw-nft render > "$tempdir/rules.nft"
-          sudo nft -c -f "$tempdir/rules.nft"
-      - name: Real TCP and UDP forwarding in three isolated network namespaces
-        run: sudo bash tests/network_namespace.sh
-      - name: Native nftables atomic replacement (isolated network namespace)
+          sudo apt-get install -y -qq shellcheck
+          shellcheck -S warning portfw install.sh install-native.sh tests/network_namespace.sh tests/dns_rotation_namespace.sh tests/ci_install_smoke.sh
+      - name: Actionlint workflow validation
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 -color
+      - name: Python security scan (high/medium)
         run: |
-          tempdir="$(mktemp -d)"
-          ns="portfw-ci-$RANDOM"
-          trap 'sudo ip netns del "$ns" 2>/dev/null || true; rm -rf "$tempdir"' EXIT
+          python3 -m venv "$RUNNER_TEMP/bandit-venv"
+          "$RUNNER_TEMP/bandit-venv/bin/pip" -q install bandit==1.8.6
+          "$RUNNER_TEMP/bandit-venv/bin/bandit" -q -ll portfw-nft portfw-migrate
+
+  native:
+    name: Native kernel tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 16
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq nftables iptables iproute2
+      - name: Unit and contract tests
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Validate native nftables rendering
+        run: |
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+          printf '1|2001-2003,2010|192.0.2.50|3001-3003,8080|both\n2|5001|edge.example.net|6001|tcp\n' > "$tmp/rules.db"
+          printf 'edge.example.net|198.51.100.7\n' > "$tmp/dns-cache.db"
+          PORTFW_STATE_DIR="$tmp" python3 portfw-nft render > "$tmp/render.nft"
+          sudo nft -c -f "$tmp/render.nft"
+      - name: Real TCP and UDP forwarding + range/list + SNAT + reload
+        run: sudo bash tests/network_namespace.sh
+      - name: DNS A-record rotation and fallback in isolated kernel network
+        run: sudo bash tests/dns_rotation_namespace.sh
+      - name: Concurrent writers and failed applies do not corrupt state
+        run: python3 tests/concurrent_cli.py
+      - name: Atomic table replacement inside isolated network namespace
+        run: |
+          tmp="$(mktemp -d)"
+          ns="portfw-ci-$$"
+          trap 'sudo ip netns del "$ns" 2>/dev/null || true; rm -rf "$tmp"' EXIT
           sudo ip netns add "$ns"
-          printf '1|2001-2003|192.0.2.50|3001-3003|tcp\n' > "$tempdir/rules.db"
-          PORTFW_STATE_DIR="$tempdir" python3 portfw-nft render > "$tempdir/initial.nft"
-          sudo ip netns exec "$ns" nft -f "$tempdir/initial.nft"
-          printf '1|2001-2003|198.51.100.7|4001-4003|tcp\n' > "$tempdir/rules.db"
-          echo 'delete table ip ifm_portfw' > "$tempdir/replace.nft"
-          PORTFW_STATE_DIR="$tempdir" python3 portfw-nft render >> "$tempdir/replace.nft"
-          sudo ip netns exec "$ns" nft -c -f "$tempdir/replace.nft"
-          sudo ip netns exec "$ns" nft -f "$tempdir/replace.nft"
+          printf '1|2001-2003|192.0.2.50|3001-3003|tcp\n' > "$tmp/rules.db"
+          PORTFW_STATE_DIR="$tmp" python3 portfw-nft render > "$tmp/initial.nft"
+          sudo ip netns exec "$ns" nft -f "$tmp/initial.nft"
+          printf '1|2001-2003|198.51.100.7|4001-4003|tcp\n' > "$tmp/rules.db"
+          echo 'delete table ip ifm_portfw' > "$tmp/replace.nft"
+          PORTFW_STATE_DIR="$tmp" python3 portfw-nft render >> "$tmp/replace.nft"
+          sudo ip netns exec "$ns" nft -c -f "$tmp/replace.nft"
+          sudo ip netns exec "$ns" nft -f "$tmp/replace.nft"
           sudo ip netns exec "$ns" nft list table ip ifm_portfw | grep -q '198.51.100.7'
+
+  debian:
+    name: Debian compatibility (${{ matrix.release }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        release: [bookworm, trixie]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unit, installer and service contract smoke tests in disposable Debian
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/repo:ro" -w /repo \
+            "debian:${{ matrix.release }}" \
+            bash -ec '
+              apt-get update -qq
+              apt-get install -y -qq python3 nftables iptables iproute2 util-linux libc-bin curl
+              python3 -m unittest discover -s tests -p "test_*.py" -v
+              bash tests/ci_install_smoke.sh
+            '
+
+  quality:
+    name: quality
+    if: always()
+    needs: [static, native, debian]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Require every release gate to pass
+        env:
+          STATIC_RESULT: ${{ needs.static.result }}
+          NATIVE_RESULT: ${{ needs.native.result }}
+          DEBIAN_RESULT: ${{ needs.debian.result }}
+        run: |
+          printf 'static=%s native=%s debian=%s\n' \
+            "$STATIC_RESULT" "$NATIVE_RESULT" "$DEBIAN_RESULT"
+          [[ "$STATIC_RESULT" == success ]]
+          [[ "$NATIVE_RESULT" == success ]]
+          [[ "$DEBIAN_RESULT" == success ]]

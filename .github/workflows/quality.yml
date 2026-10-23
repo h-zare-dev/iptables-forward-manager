@@ -25,13 +25,13 @@ jobs:
         run: git diff --check
       - name: Shell and Python syntax
         run: |
-          bash -n portfw install.sh install-native.sh tests/network_namespace.sh tests/dns_rotation_namespace.sh tests/ci_install_smoke.sh
+          bash -n portfw install.sh install-native.sh tests/network_namespace.sh tests/dns_rotation_namespace.sh tests/service_restore_namespace.sh tests/ci_install_smoke.sh
           python3 -m py_compile portfw-nft portfw-migrate tests/*.py
       - name: ShellCheck
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq shellcheck
-          shellcheck -S warning portfw install.sh install-native.sh tests/network_namespace.sh tests/dns_rotation_namespace.sh tests/ci_install_smoke.sh
+          shellcheck -S warning portfw install.sh install-native.sh tests/network_namespace.sh tests/dns_rotation_namespace.sh tests/service_restore_namespace.sh tests/ci_install_smoke.sh
       - name: Actionlint workflow validation
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 -color
       - name: Python security scan (high/medium)
@@ -70,6 +70,8 @@ jobs:
         run: sudo bash tests/dns_rotation_namespace.sh
       - name: Concurrent writers and failed applies do not corrupt state
         run: sudo python3 tests/concurrent_cli.py
+      - name: Real systemd enable and restore in isolated network namespace
+        run: sudo env CI_PORTFW_TEST=1 GITHUB_ACTIONS=true bash tests/service_restore_namespace.sh
       - name: Atomic table replacement inside isolated network namespace
         run: |
           tmp="$(mktemp -d)"

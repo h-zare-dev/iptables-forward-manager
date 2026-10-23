@@ -2,12 +2,22 @@ name: Shell syntax
 
 on:
   push:
+    branches: [development, main, 'feature/**', 'docs/**']
   pull_request:
+    branches: [development, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   bash-syntax:
-    runs-on: ubuntu-latest
+    name: bash-syntax
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
-      - name: Validate Bash syntax
-        run: bash -n portfw install.sh
+      - uses: actions/checkout@v5
+      - name: Validate all Bash and Python entrypoints
+        run: |
+          bash -n portfw install.sh install-native.sh tests/network_namespace.sh tests/dns_rotation_namespace.sh tests/service_restore_namespace.sh tests/ci_install_smoke.sh
+          python3 -m py_compile portfw-nft portfw-migrate tests/*.py

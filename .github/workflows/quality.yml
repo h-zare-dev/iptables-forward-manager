@@ -21,8 +21,10 @@ jobs:
     timeout-minutes: 12
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 2
       - name: Whitespace and patch validation
-        run: git diff --check
+        run: git diff --check HEAD^ HEAD
       - name: Shell and Python syntax
         run: |
           bash -n portfw install.sh install-native.sh tests/network_namespace.sh tests/dns_rotation_namespace.sh tests/service_restore_namespace.sh tests/ci_install_smoke.sh

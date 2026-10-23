@@ -1,8 +1,8 @@
-# Native nftables candidate (v2.0.0-rc1)
+# Native nftables v2.0.0-rc3 — technical reference
 
-**Status: opt-in / staging only.** The stable `portfw` (iptables-nft) and its systemd service are intentionally unchanged. The candidate lives at `portfw-nft` and must NOT automatically be activated on production servers.
+**Status:** Native nftables v2.0.0-rc3 is available from `main`. The side-by-side installer remains intentionally **non-activating**: it does not migrate or restart the firewall. The legacy `portfw` (iptables-nft) and its service are retained for compatibility, but must not run alongside the activated native engine. See the [README](../README.md) for normal operation and [safe cutover guide](SAFE_NATIVE_CUTOVER.md) for migration.
 
-## Why a separate candidate?
+## Why a separate native executable?
 
 A direct in-place upgrade would be unsafe on active high-throughput forwarding servers. The legacy application installs `IFM_DNAT`, `IFM_SNAT` and `IFM_FORWARD` chains. Running new native NAT rules in parallel with the legacy jumps can create double-NAT, rule ordering ambiguity, and dropped connections. The candidate explicitly **refuses to modify nftables while it sees the legacy `IFM_DNAT` jump active**.
 
@@ -33,10 +33,10 @@ For example:
 - The native engine uses named maps for DNAT and named sets for FORWARD and precise SNAT. No per-packet DNS requests.
 - Existing conntrack sessions are not flushed when rules change. Established connections are *not migrated* to a new DNS target.
 
-## Installation on a test server only
+## Native installation (side by side, no activation)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/h-zare-dev/iptables-forward-manager/feature/native-nft-range-dns/install-native.sh | sudo PORTFW_REF=feature/native-nft-range-dns bash
+curl -fsSL https://raw.githubusercontent.com/h-zare-dev/iptables-forward-manager/main/install-native.sh | sudo PORTFW_REF=main bash
 ```
 
 Prerequisites: Python 3, `nft`, `ip`, `getent`, systemd, and root privileges for mutation. On Debian/Ubuntu, install missing requirements with:
@@ -47,11 +47,11 @@ sudo apt-get install -y python3 nftables iproute2 libc-bin
 
 Installation puts `/usr/local/bin/portfw-nft` alongside the old `/usr/local/bin/portfw` and installs **disabled** candidate units:
 
-- `portfw-nft.service` — persistent native rules at boot (enable only after explicit cutover).
+- `portfw-nft.service` — persistent native rules at boot (enable only after a verified initial activation or controlled cutover).
 - `portfw-dns-refresh.service` — oneshot DNS re-resolution, separate from forwarding data plane.
 - `portfw-dns-refresh.timer` — default 5 minutes, install-disabled.
 
-No legacy service is stopped, no iptables chains are removed, no native rules are activated, and no DNS timer is enabled by the installer.
+No legacy service is stopped, no iptables chains are removed, no native rules are activated, and no DNS timer is enabled by the installer. The migration helper `portfw-migrate` is also installed but does nothing automatically.
 
 Read-only inspection:
 
@@ -73,7 +73,7 @@ rm -rf "$tmp"
 
 **Cutover caveat:** Removing the legacy PREROUTING, POSTROUTING and FORWARD jumps and enabling the new native hooks is not a single atomic operation across the two engines. Do not perform it during high traffic or assume uninterrupted zero-loss migration. First review the old and new rules on the actual test server, back up `rules.db`, record old nft/iptables rules, verify Docker/UFW policies, and agree on a maintenance window and rollback steps. The new `portfw-nft apply` explicitly fails closed while the old PREROUTING IFM jump is active. After a controlled cutover, enable `portfw-nft.service` only after native rules have been validated. Do **not** flush the entire nftables ruleset or conntrack table.
 
-## CLI (after cutover, when old jumps are inactive)
+## CLI (native active, legacy hooks detached)
 
 ```bash
 sudo portfw-nft                   # interactive menu
@@ -114,6 +114,6 @@ Available timer intervals: **1, 2, 3, 5 (default), 10, 15, 20, 30, 45 and 60 min
 - Unit tests for positional mappings, ranges, mixed lists, duplicates/conflicts, legacy state parsing, invalid IP/domain input, persistence, no-op DNS, DNS failure and rollback on failed apply.
 - A privileged **`nft -c` dry-run**, rendering a mixed range/list and a cached domain to detect nftables expression errors without changing kernel rules.
 
-What CI does **not** establish: production live NAT behavior, interoperability with arbitrary firewall default-drop policies, throughput, jitter or zero-disruption cutover. These require explicit test-server staging with observed forwarding traffic, established TCP/UDP sessions, DNS changes and a rollback drill.
+Quality CI additionally executes actual TCP/UDP forwarding and SNAT across isolated Linux network namespaces and tests the migration ordering/UI behavior. The migration and port range/list creation were manually exercised on `test-de`; the temporary test rules were removed afterwards. What CI and these spot tests **do not** establish: live DNS A-record rotation, sustained production multi-Gbps throughput, interoperability with every external firewall, jitter improvements or zero-disruption migration. Those need separate on-host verification.
 
-Release procedure: `feature/native-nft-range-dns` → PR to `development` → **manual test on test-de** → subsequent PR `development` → `main` with human-controlled merge.
+Release workflow: feature branch → PR to `development` → CI and manual test on `test-de` → owner-reviewed PR from `development` to `main`. v2.0.0-rc3 has already been promoted to `main`; future changes use the same workflow.

@@ -144,6 +144,57 @@ class StorageAndRefreshTests(unittest.TestCase):
                 fw.change("add", args)
         self.assertEqual(len(fw.read_rules()), 1)
 
+    def test_first_successful_add_enables_boot_persistence_without_restart(self):
+        import argparse
+        import subprocess
+        args = argparse.Namespace(source="2001", target="192.0.2.50", dest="3001", protocol="tcp")
+        def fake_run(command, **kwargs):
+            if command[:2] == ["systemctl", "is-enabled"]:
+                return subprocess.CompletedProcess(command, 1, stdout="disabled\n", stderr="")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+        with patch.object(fw, "apply") as apply, patch.object(fw, "run", side_effect=fake_run) as run:
+            fw.change("add", args)
+            apply.assert_called_once()
+            calls = [call.args[0] for call in run.call_args_list]
+        self.assertIn(["systemctl", "enable", "portfw-nft.service"], calls)
+        self.assertNotIn(["systemctl", "enable", "--now", "portfw-nft.service"], calls)
+        self.assertNotIn(["systemctl", "restart", "portfw-nft.service"], calls)
+        self.assertEqual(len(fw.read_rules()), 1)
+
+    def test_subsequent_add_does_not_override_manual_service_disable(self):
+        import argparse
+        fw.save_rules([fw.make_rule(1, "2001", "192.0.2.50", "3001", "tcp")])
+        args = argparse.Namespace(source="2002", target="192.0.2.50", dest="3002", protocol="tcp")
+        with patch.object(fw, "apply"), patch.object(fw, "run") as run:
+            fw.change("add", args)
+            run.assert_not_called()
+
+    def test_failed_first_add_does_not_enable_service(self):
+        import argparse
+        args = argparse.Namespace(source="2001", target="192.0.2.50", dest="3001", protocol="tcp")
+        with patch.object(fw, "apply", side_effect=fw.PortfwError("nft failed")), \
+             patch.object(fw, "run") as run:
+            with self.assertRaisesRegex(fw.PortfwError, "nft failed"):
+                fw.change("add", args)
+            run.assert_not_called()
+        self.assertEqual(fw.read_rules(), [])
+
+    def test_enable_failure_keeps_successful_forwarding_and_warns(self):
+        import argparse
+        import subprocess
+        import io
+        from contextlib import redirect_stderr
+        args = argparse.Namespace(source="2001", target="192.0.2.50", dest="3001", protocol="tcp")
+        def fake_run(command, **kwargs):
+            if command[:2] == ["systemctl", "is-enabled"]:
+                return subprocess.CompletedProcess(command, 1, stdout="disabled\n", stderr="")
+            raise fw.PortfwError("systemctl enable failed")
+        errors = io.StringIO()
+        with patch.object(fw, "apply"), patch.object(fw, "run", side_effect=fake_run), redirect_stderr(errors):
+            fw.change("add", args)
+        self.assertIn("automatic boot restore could not be enabled", errors.getvalue())
+        self.assertEqual(len(fw.read_rules()), 1)
+
     def test_file_permission(self):
         fw.save_cache({"edge.example.net": "192.0.2.50"})
         self.assertEqual(fw.CACHE.stat().st_mode & 0o777, 0o600)

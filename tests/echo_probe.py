@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """TCP/UDP echo probes for the *isolated* network-namespace data-plane test."""
+import os
 import socket
 import sys
 import threading
@@ -8,7 +9,7 @@ from pathlib import Path
 
 SERVER_IP = "198.18.12.2"
 EXPECTED_SNAT = "198.18.12.1"
-ROUTER_CLIENT_IP = "198.18.11.1"
+ROUTER_CLIENT_IP = os.environ.get("PORTFW_PROBE_SERVER_IP", "198.18.11.1")
 PORTS = (3001, 3002, 3003, 8080, 6001)
 
 

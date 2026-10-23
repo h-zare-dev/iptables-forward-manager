@@ -58,6 +58,7 @@ for ns in "$NSC" "$NSR" "$NSD"; do ip -n "$ns" link set lo up; done
 
 ip -n "$NSC" address add 198.18.11.2/24 dev eth0
 ip -n "$NSR" address add 198.18.11.1/24 dev eth0
+ip -n "$NSR" address add 198.18.11.3/24 dev eth0 # secondary/floating-style local IPv4
 ip -n "$NSR" address add 198.18.12.1/24 dev eth1
 ip -n "$NSD" address add 198.18.12.2/24 dev eth0
 ip -n "$NSC" link set eth0 up
@@ -101,6 +102,10 @@ for proto in tcp udp; do
   done
 done
 ip netns exec "$NSC" python3 "$ROOT/tests/echo_probe.py" probe tcp 5001 6001
+
+echo "Forwarding must accept packets to the secondary/floating local IPv4"
+ip netns exec "$NSC" env PORTFW_PROBE_SERVER_IP=198.18.11.3 python3 "$ROOT/tests/echo_probe.py" probe tcp 2001 3001
+ip netns exec "$NSC" env PORTFW_PROBE_SERVER_IP=198.18.11.3 python3 "$ROOT/tests/echo_probe.py" probe udp 2010 8080
 
 echo "Reapply idempotence and verify traffic continues"
 ip netns exec "$NSR" env PORTFW_STATE_DIR="$STATE" PORTFW_LOCK="$TMP/.lock" python3 "$ENGINE" reload

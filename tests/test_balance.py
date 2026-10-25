@@ -152,7 +152,7 @@ class TimedBalancingTests(unittest.TestCase):
         self.assertFalse(fw.BALANCE.exists())
 
     def test_balance_file_validation(self):
-        fw.BALANCE.write_text(f"{HOST}|0|{A}|1000\n")
+        fw.BALANCE.write_text(f"{HOST}|61|{A}|1000\n")
         with self.assertRaises(fw.PortfwError):
             fw.read_balance()
         fw.BALANCE.write_text(f"{HOST}|5|{A}|1000\n{HOST}|5|{A}|1001\n")
@@ -182,6 +182,79 @@ class TimedBalancingTests(unittest.TestCase):
         fw.save_rules([self.rule, fw.make_rule(2, "2030", HOST, "2030", "tcp")])
         self.assertEqual(self.refresh(1300), 1)
         self.assertEqual(fw.read_cache()[HOST], B)
+
+    def test_per_connection_requires_at_least_two_records(self):
+        with patch.object(fw, "resolve_all", return_value=[A]), \
+             self.assertRaisesRegex(fw.PortfwError, "at least two"):
+            fw.configure_balance(1, True, mode="round-robin")
+
+    def test_per_connection_mode_persists_and_installs_kernel_once(self):
+        with patch.object(fw, "resolve_all", return_value=[A, B]), \
+             patch.object(fw, "apply") as apply:
+            fw.configure_balance(1, True, mode="round-robin")
+        apply.assert_called_once()
+        self.assertEqual(fw.read_balance()[HOST][0], 0)
+        self.assertEqual(fw.read_backends()[HOST], [A, B])
+
+    def test_per_connection_polls_without_replacing_unchanged_nft(self):
+        with patch.object(fw, "resolve_all", return_value=[A, B]), \
+             patch.object(fw, "apply"):
+            fw.configure_balance(1, True, mode="round-robin")
+        self.assertEqual(self.refresh(999999, addresses=[A, B]), 0)
+        self.assertEqual(fw.read_backends()[HOST], [A, B])
+
+    def test_per_connection_dns_change_updates_kernel_destinations(self):
+        with patch.object(fw, "resolve_all", return_value=[A, B]), \
+             patch.object(fw, "apply"):
+            fw.configure_balance(1, True, mode="round-robin")
+        self.assertEqual(self.refresh(10000, addresses=[B, C]), 1)
+        self.assertEqual(fw.read_backends()[HOST], [B, C])
+        self.assertEqual(fw.read_balance()[HOST][0], 0)
+
+    def test_per_connection_dns_failure_keeps_last_good_backends(self):
+        with patch.object(fw, "resolve_all", return_value=[A, B]), \
+             patch.object(fw, "apply"):
+            fw.configure_balance(1, True, mode="round-robin")
+        self.assertEqual(self.refresh(10000, failed=True), 0)
+        self.assertEqual(fw.read_backends()[HOST], [A, B])
+
+    def test_per_connection_kernel_apply_failure_leaves_mode_off(self):
+        with patch.object(fw, "resolve_all", return_value=[A, B]), \
+             patch.object(fw, "apply", side_effect=fw.PortfwError("nft rejected")):
+            with self.assertRaisesRegex(fw.PortfwError, "nft rejected"):
+                fw.configure_balance(1, True, mode="round-robin")
+        self.assertFalse(fw.BALANCE.exists())
+        self.assertFalse(fw.BACKENDS.exists())
+
+    def test_per_connection_disabling_restores_static_nft(self):
+        with patch.object(fw, "resolve_all", return_value=[A, B]), \
+             patch.object(fw, "apply"):
+            fw.configure_balance(1, True, mode="round-robin")
+        with patch.object(fw, "apply") as apply:
+            fw.configure_balance(1, False)
+        apply.assert_called_once()
+        self.assertEqual(fw.read_balance(), {})
+        self.assertEqual(fw.read_backends(), {})
+
+    def test_static_and_rr_uses_shared_postrouting_and_explicit_tcp_udp(self):
+        r2 = fw.make_rule(2, "2030", "198.51.100.77", "3030", "both")
+        self.assertEqual(fw.read_cache()[HOST], A)
+        script = fw.nft_config([self.rule, r2], {HOST: A}, "198.51.100.80",
+            balance={HOST: (0, A, 1000)}, backends={HOST: [A, B]})
+        self.assertIn("numgen inc mod 2", script)
+        self.assertIn("tcp_rr2", script)
+        self.assertIn("udp_rr2", script)
+        self.assertIn("2020 . 0 : 198.51.100.10 . 2020", script)
+        self.assertIn("2020 . 1 : 198.51.100.20 . 2020", script)
+        self.assertIn("2030 : 198.51.100.77 . 3030", script)
+        self.assertIn("198.51.100.20 . 2020 . 2020", script)
+
+    def test_rr_mode_limit_rejects_mapping_explosion(self):
+        src = ",".join(str(x) for x in range(1001, 1002))
+        rec = fw.make_rule(1, src, HOST, "2020", "both")
+        with patch.object(fw, "MAX_RR_MAPPINGS", 1), self.assertRaisesRegex(fw.PortfwError, "Too many"):
+            fw.nft_config([rec], {HOST: A}, A, balance={HOST:(0,A,100)},
+                          backends={HOST:[A,B]})
 
     def test_new_domain_config_defaults_to_off(self):
         self.assertEqual(self.refresh(1800), 0)

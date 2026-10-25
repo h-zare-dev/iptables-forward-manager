@@ -398,65 +398,113 @@ def table_exists():
     return run(["nft", "list", "table", "ip", TABLE], check=False, timeout=5).returncode == 0
 
 
-def nft_config(records, cache, primary, *, existing=False):
-    """Render ONLY the program-owned table, replace it as one nft transaction."""
+def nft_config(records, cache, primary, *, existing=False, balance=None, backends=None):
+    """Render ONLY program-owned table; static + timed maps and per-flow RR maps."""
     validate_rules(records)
     primary = ipv4(primary)
+    balance = {} if balance is None else balance
+    backends = {} if backends is None else backends
     maps = {"tcp": [], "udp": []}
+    rr_maps = {"tcp": {}, "udp": {}}   # count -> [(port, index, IP, dst_port)]
     fw = {"tcp": set(), "udp": set()}
     snat = {"tcp": set(), "udp": set()}
+    rr_total = 0
     for _, source, target, dest, protocol in records:
-        ip = cache.get(target) if is_domain(target) else target
-        if not ip:
-            raise PortfwError(f"No DNS cache for {target}; run --dns-refresh first")
-        ip = ipv4(ip)
+        selected = cache.get(target) if is_domain(target) else target
+        if not selected:
+            raise PortfwError(f"No DNS cache for {target}; run dns-refresh first")
+        selected = ipv4(selected)
+        rr_enabled = is_domain(target) and target in balance and balance[target][0] == 0
+        targets = backends.get(target) if rr_enabled else [selected]
+        if not targets:
+            raise PortfwError(f"No durable backend A records for RR domain {target}")
+        targets = sorted({ipv4(x) for x in targets}, key=lambda x: int(ipaddress.IPv4Address(x)))
         for p in PROTOCOLS[protocol]:
             for s, d in zip(ports(source), ports(dest)):
-                maps[p].append((s, ip, d))
-                fw[p].add((ip, d))
-                snat[p].add((ip, d, s))
+                if rr_enabled and len(targets) > 1:
+                    rr_total += len(targets)
+                    if rr_total > MAX_RR_MAPPINGS:
+                        raise PortfwError(f"Too many expanded RR endpoints; limit {MAX_RR_MAPPINGS}")
+                    rr_maps[p].setdefault(len(targets), []).extend(
+                        (s, i, ip, d) for i, ip in enumerate(targets)
+                    )
+                else:
+                    maps[p].append((s, targets[0], d))
+                for ip in targets:
+                    fw[p].add((ip, d))
+                    snat[p].add((ip, d, s))
     lines = []
     if existing:
         lines.append(f"delete table ip {TABLE}")
     lines.append(f"add table ip {TABLE}")
     for proto in ("tcp", "udp"):
-        lines += [
+        lines.extend([
             f"add map ip {TABLE} {proto}_dnat {{ type inet_service : ipv4_addr . inet_service; }}",
             f"add set ip {TABLE} {proto}_forward {{ type ipv4_addr . inet_service; }}",
             f"add set ip {TABLE} {proto}_snat {{ type ipv4_addr . inet_service . inet_service; }}",
-        ]
+        ])
         if maps[proto]:
-            values = ", ".join(f"{s} : {ip} . {d}" for s, ip, d in sorted(maps[proto]))
+            values = ", ".join(f"{source} : {ip} . {dest}" for source, ip, dest in sorted(maps[proto]))
             lines.append(f"add element ip {TABLE} {proto}_dnat {{ {values} }}")
-            targets = ", ".join(f"{ip} . {d}" for ip, d in sorted(fw[proto]))
+        for count, entries in sorted(rr_maps[proto].items()):
+            name = f"{proto}_rr{count}"
+            # The port guard avoids failed map lookups for unrelated static ports.
+            lines.extend([
+                f"add map ip {TABLE} {name} {{ type inet_service . integer : ipv4_addr . inet_service; }}",
+                f"add set ip {TABLE} {name}_ports {{ type inet_service; }}",
+            ])
+            elements = ", ".join(f"{sp} . {index} : {ip} . {dp}"
+                                 for sp, index, ip, dp in sorted(entries))
+            lines.append(f"add element ip {TABLE} {name} {{ {elements} }}")
+            source_ports = ", ".join(str(x) for x in sorted({a for a, _, _, _ in entries}))
+            lines.append(f"add element ip {TABLE} {name}_ports {{ {source_ports} }}")
+        if fw[proto]:
+            targets = ", ".join(f"{ip} . {dest}" for ip, dest in sorted(fw[proto]))
             lines.append(f"add element ip {TABLE} {proto}_forward {{ {targets} }}")
-            origins = ", ".join(f"{ip} . {d} . {s}" for ip, d, s in sorted(snat[proto]))
+            origins = ", ".join(f"{ip} . {dest} . {sp}" for ip, dest, sp in sorted(snat[proto]))
             lines.append(f"add element ip {TABLE} {proto}_snat {{ {origins} }}")
-    lines += [
+    lines.extend([
         f"add chain ip {TABLE} prerouting {{ type nat hook prerouting priority -101; policy accept; }}",
         f"add chain ip {TABLE} postrouting {{ type nat hook postrouting priority 99; policy accept; }}",
         f"add chain ip {TABLE} forwarding {{ type filter hook forward priority -5; policy accept; }}",
         f"add rule ip {TABLE} forwarding ct state established,related accept",
-    ]
+    ])
     for proto in ("tcp", "udp"):
-        if not maps[proto]:
-            continue
-        lines += [
-            f"add rule ip {TABLE} prerouting fib daddr type local ip protocol {proto} dnat ip addr . port to {proto} dport map @{proto}_dnat",
-            f"add rule ip {TABLE} forwarding ct status dnat ip protocol {proto} ip daddr . {proto} dport @{proto}_forward accept",
-            f"add rule ip {TABLE} postrouting ct status dnat ip protocol {proto} ip daddr . {proto} dport . ct original proto-dst @{proto}_snat snat to {primary}",
-        ]
+        if maps[proto]:
+            lines.append(
+                f"add rule ip {TABLE} prerouting fib daddr type local ip protocol {proto} "
+                f"dnat ip addr . port to {proto} dport map @{proto}_dnat"
+            )
+        for count in sorted(rr_maps[proto]):
+            name = f"{proto}_rr{count}"
+            lines.append(
+                f"add rule ip {TABLE} prerouting fib daddr type local ip protocol {proto} "
+                f"{proto} dport @{name}_ports "
+                f"dnat ip addr . port to {proto} dport . numgen inc mod {count} map @{name}"
+            )
+        if fw[proto]:
+            lines.extend([
+                f"add rule ip {TABLE} forwarding ct status dnat ip protocol {proto} "
+                f"ip daddr . {proto} dport @{proto}_forward accept",
+                f"add rule ip {TABLE} postrouting ct status dnat ip protocol {proto} "
+                f"ip daddr . {proto} dport . ct original proto-dst @{proto}_snat "
+                f"snat to {primary}",
+            ])
     return "\n".join(lines) + "\n"
 
 
-def apply(records, cache):
+def apply(records, cache, *, balance=None, backends=None):
     if legacy_active():
         raise PortfwError("Legacy IFM_DNAT jump is active. Refusing overlapping NAT. Perform a controlled maintenance migration.")
     if not shutil.which("nft"):
         raise PortfwError("nft executable not installed")
     primary = primary_ipv4()
-    script = nft_config(records, cache, primary, existing=table_exists())
-    # Ensure prerequisites before committing the atomic firewall transaction.
+    if balance is None:
+        balance = read_balance()
+    if backends is None:
+        backends = read_backends()
+    script = nft_config(records, cache, primary, existing=table_exists(),
+                        balance=balance, backends=backends)
     run(["sysctl", "-w", "net.ipv4.ip_forward=1"], timeout=5)
     run(["nft", "-c", "-f", "-"], input=script, timeout=15)
     run(["nft", "-f", "-"], input=script, timeout=15)

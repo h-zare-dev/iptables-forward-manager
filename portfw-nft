@@ -557,29 +557,35 @@ def change(action, args):
     with locked():
         records = read_rules()
         first_add = action == "add" and not records
-        cache = read_cache()
-        old_cache = dict(cache)
+        old_cache = read_cache()
+        cache = dict(old_cache)
         proposed = updated_records(action, args, records)
-        previous_balance = read_balance()
+        old_balance = read_balance()
+        old_backends = read_backends()
         new_hosts = {r[2] for r in proposed if is_domain(r[2])}
-        next_balance = {k: v for k, v in previous_balance.items() if k in new_hosts}
+        next_balance = {k: v for k, v in old_balance.items() if k in new_hosts}
+        next_backends = {k: v for k, v in old_backends.items() if k in next_balance
+                         and next_balance[k][0] == 0}
         for host in sorted(new_hosts):
             if host not in cache:
                 cache[host] = resolve(host)
-        # Apply before persisting; a failed nft validation leaves saved state intact.
-        apply(proposed, cache)
+        new_cache = {k: v for k, v in cache.items() if k in new_hosts}
+        # Apply the PROPOSED mode, never an old config when a domain was deleted.
+        apply(proposed, new_cache, balance=next_balance, backends=next_backends)
         try:
             save_rules(proposed)
-            save_cache({k: v for k, v in cache.items() if k in new_hosts})
-            if next_balance != previous_balance:
+            save_cache(new_cache)
+            if next_balance != old_balance:
                 save_balance(next_balance)
+            if next_backends != old_backends:
+                save_backends(next_backends)
         except OSError as exc:
-            # Restore the previous nft transaction and disk state, best effort.
             try:
-                apply(records, old_cache)
+                apply(records, old_cache, balance=old_balance, backends=old_backends)
                 save_rules(records)
                 save_cache(old_cache)
-                save_balance(previous_balance)
+                save_balance(old_balance)
+                save_backends(old_backends)
             except (OSError, PortfwError) as rollback_exc:
                 print(f"CRITICAL: persistence rollback failed: {rollback_exc}", file=sys.stderr)
             raise PortfwError(f"Could not persist change: {exc}") from exc
@@ -589,28 +595,28 @@ def change(action, args):
 
 
 def refresh_dns():
-    """Poll DNS and rotate opted-in domains after interval; never touch nft on no-op."""
+    """Poll A records; timed rotates on due time; RR updates backend map on change."""
     with locked():
         records = read_rules()
         hosts = sorted({r[2] for r in records if is_domain(r[2])})
-        active_balance = read_balance()
-        old_cache = read_cache()
     if not hosts:
         print("DNS: no domains configured; no firewall changes")
         return
     results = {}
     for host in hosts:
         try:
-            # Use every A record only for domains with explicit timed balancing.
-            results[host] = resolve_all(host) if host in active_balance else [resolve(host)]
+            results[host] = resolve_all(host)
         except PortfwError as exc:
             print(f"DNS warning: {exc}; keeping last known good IP", file=sys.stderr)
     with locked():
         records = read_rules()
         hosts = {r[2] for r in records if is_domain(r[2])}
-        cache = read_cache()
+        old_cache = read_cache()
+        cache = dict(old_cache)
         balance = read_balance()
         new_balance = dict(balance)
+        old_backends = read_backends()
+        backends = dict(old_backends)
         now = int(time.time())
         for host in hosts:
             if host not in results:
@@ -618,44 +624,51 @@ def refresh_dns():
             addresses = results[host]
             if host in balance:
                 minutes, selected, last = balance[host]
-                # Persisted selected IP is the last committed target.
-                # If a previous update was rolled back, trust the live cache.
-                current = cache.get(host, selected)
-                chosen, next_last = next_rotation(current, addresses, last, minutes, now)
-                cache[host] = chosen
-                new_balance[host] = (minutes, chosen, next_last)
+                if minutes == 0:  # per-connection RR; no timed selection
+                    backends[host] = addresses
+                    current = cache.get(host, selected)
+                    chosen = current if current in addresses else addresses[0]
+                    cache[host] = chosen
+                    new_balance[host] = (0, chosen, last)
+                else:
+                    current = cache.get(host, selected)
+                    chosen, next_last = next_rotation(current, addresses, last, minutes, now)
+                    cache[host] = chosen
+                    new_balance[host] = (minutes, chosen, next_last)
             else:
                 cache[host] = addresses[0]
         if any(host not in cache for host in hosts):
             raise PortfwError("At least one domain has no valid resolved address")
         new_cache = {k: v for k, v in cache.items() if k in hosts}
-        old_active = {k: v for k, v in read_cache().items() if k in hosts}
-        # Another command may have updated the config during unlocked DNS lookups.
-        # Missing/changed host selection must not overwrite an unrelated state.
-        if new_cache == old_active and new_balance == balance:
+        changed = new_cache != old_cache or backends != old_backends
+        if not changed and new_balance == balance:
             print("DNS: unchanged; firewall untouched")
             return
-        changed = new_cache != old_active
         if changed:
-            apply(records, new_cache)
+            apply(records, new_cache, balance=new_balance, backends=backends)
         try:
-            if changed:
+            if new_cache != old_cache:
                 save_cache(new_cache)
             if new_balance != balance:
                 save_balance(new_balance)
+            if backends != old_backends:
+                save_backends(backends)
         except OSError as exc:
             try:
                 if changed:
-                    apply(records, old_active)
-                    save_cache(old_active)
+                    apply(records, old_cache, balance=balance, backends=old_backends)
+                save_cache(old_cache)
                 save_balance(balance)
+                save_backends(old_backends)
             except (OSError, PortfwError) as rollback_exc:
-                print(f"CRITICAL: DNS rotation rollback failed: {rollback_exc}", file=sys.stderr)
+                print(f"CRITICAL: DNS balance rollback failed: {rollback_exc}", file=sys.stderr)
             raise PortfwError(f"Could not persist DNS cache/balance: {exc}") from exc
         if changed:
-            for host in sorted(hosts & new_balance.keys()):
-                if new_cache.get(host) != old_active.get(host):
-                    print(f"DNS balance: {host} -> {new_cache[host]}")
+            for host in sorted(hosts):
+                if host in new_balance and new_balance[host][0] == 0 and backends.get(host) != old_backends.get(host):
+                    print(f"DNS per-connection backends updated: {host}: {', '.join(backends[host])}")
+                elif new_cache.get(host) != old_cache.get(host):
+                    print(f"DNS target: {host} -> {new_cache[host]}")
             print("DNS: changes applied atomically")
         else:
             print("DNS: balance state updated; firewall untouched")

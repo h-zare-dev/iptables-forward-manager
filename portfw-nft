@@ -13,11 +13,13 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
-VERSION = "2.0.0-rc3"
+VERSION = "2.1.0-rc1"
 STATE_DIR = Path(os.environ.get("PORTFW_STATE_DIR", "/etc/iptables-forward-manager"))
 RULES = STATE_DIR / "rules.db"
 CACHE = STATE_DIR / "dns-cache.db"
+BALANCE = STATE_DIR / "dns-balance.db"
 LOCK = Path(os.environ.get("PORTFW_LOCK", "/run/iptables-forward-manager.lock"))
 TABLE = "ifm_portfw"
 INTERVALS = (1, 2, 3, 5, 10, 15, 20, 30, 45, 60)
@@ -181,6 +183,32 @@ def save_cache(cache):
     write_atomic(CACHE, "".join(f"{k}|{v}\n" for k, v in sorted(cache.items())))
 
 
+def read_balance():
+    """Per-domain opt-in timed rotation: minutes, selected IPv4, last switch epoch."""
+    if not BALANCE.exists():
+        return {}
+    result = {}
+    for line in BALANCE.read_text().splitlines():
+        fields = line.split("|")
+        if len(fields) != 4:
+            raise PortfwError("Malformed DNS balance state")
+        host, interval, selected, last = fields
+        if not is_domain(destination(host)) or host != destination(host):
+            raise PortfwError("Invalid DNS balance domain")
+        if host in result or not interval.isdecimal() or int(interval) not in INTERVALS:
+            raise PortfwError("Invalid or duplicate DNS balance interval")
+        if not last.isdecimal():
+            raise PortfwError("Invalid DNS balance timestamp")
+        result[host] = (int(interval), ipv4(selected), int(last))
+    return result
+
+
+def save_balance(config):
+    content = "".join(f"{host}|{minutes}|{selected}|{last}\n"
+                      for host, (minutes, selected, last) in sorted(config.items()))
+    write_atomic(BALANCE, content)
+
+
 @contextlib.contextmanager
 def locked():
     LOCK.parent.mkdir(parents=True, exist_ok=True)
@@ -189,8 +217,8 @@ def locked():
         yield
 
 
-def resolve(host):
-    # A bounded, system-resolver lookup. No shell interpolation, no DNS in packet path.
+def resolve_all(host):
+    """Return all unique eligible A records in deterministic numeric order."""
     result = run(["getent", "ahostsv4", host], timeout=5)
     addresses = set()
     for line in result.stdout.splitlines():
@@ -201,7 +229,73 @@ def resolve(host):
             continue
     if not addresses:
         raise PortfwError(f"No usable IPv4 A record for {host}")
-    return sorted(addresses, key=lambda a: int(ipaddress.IPv4Address(a)))[0]
+    return sorted(addresses, key=lambda a: int(ipaddress.IPv4Address(a)))
+
+
+def resolve(host):
+    # Legacy stable-selection behavior unless explicit balancing is enabled.
+    return resolve_all(host)[0]
+
+
+def next_rotation(current, addresses, last, interval, now):
+    """Choose a new target only when the interval expires or target disappears."""
+    if not addresses:
+        raise PortfwError("Cannot rotate without eligible IPv4 addresses")
+    if current not in addresses:
+        return addresses[0], now
+    if len(addresses) < 2 or now - last < interval * 60:
+        return current, last
+    return addresses[(addresses.index(current) + 1) % len(addresses)], now
+
+
+def configure_balance(rule_id, enable, minutes=5):
+    """Enable/disable round-robin by domain; identical hostnames share selection."""
+    if enable and minutes not in INTERVALS:
+        raise PortfwError(f"Allowed intervals in minutes: {INTERVALS}")
+    with locked():
+        rules = read_rules()
+        rule = next((r for r in rules if r[0] == rule_id), None)
+        if rule is None:
+            raise PortfwError(f"Rule ID {rule_id} not found")
+        host = rule[2]
+        if not is_domain(host):
+            raise PortfwError("Timed balancing is available only for domain destinations")
+        config = read_balance()
+        if not enable:
+            config.pop(host, None)
+            save_balance(config)
+            print(f"DNS balancing disabled for {host}; current destination unchanged")
+            return
+        addresses = resolve_all(host)
+        if len(addresses) < 2:
+            raise PortfwError(f"{host} needs at least two A records to enable balancing")
+        cache = read_cache()
+        current = cache.get(host)
+        if current not in addresses:
+            raise PortfwError("Current cached IP is not in DNS answers; run dns-refresh before enabling")
+        previous = config.get(host)
+        last = previous[2] if previous and previous[1] == current else int(time.time())
+        config[host] = (minutes, current, last)
+        save_balance(config)
+        print(f"DNS balancing: {host} every {minutes} min; current={current}; A records={', '.join(addresses)}")
+        if not _dns_is_enabled():
+            print("WARNING: DNS refresh timer is disabled. Enable it (recommended: every 1 minute) "
+                  "using 'portfw-nft timer --minutes 1 --enable'.", file=sys.stderr)
+
+
+def show_balance():
+    config = read_balance()
+    if not config:
+        print("Timed DNS balancing: disabled for all domains")
+        return
+    rules = read_rules()
+    now = int(time.time())
+    for host, (minutes, current, last) in sorted(config.items()):
+        ids = ",".join(str(r[0]) for r in rules if r[2] == host) or "(no active rule)"
+        remaining = max(0, (minutes * 60 - (now - last) + 59) // 60)
+        print(f"{host} | rule IDs={ids} | current={current} | rotate every {minutes}min "
+              f"| due in ~{remaining}min")
+    print(f"DNS poll timer: {'enabled' if _dns_is_enabled() else 'DISABLED'}")
 
 
 def primary_ipv4():
@@ -337,7 +431,9 @@ def change(action, args):
         cache = read_cache()
         old_cache = dict(cache)
         proposed = updated_records(action, args, records)
+        previous_balance = read_balance()
         new_hosts = {r[2] for r in proposed if is_domain(r[2])}
+        next_balance = {k: v for k, v in previous_balance.items() if k in new_hosts}
         for host in sorted(new_hosts):
             if host not in cache:
                 cache[host] = resolve(host)
@@ -346,12 +442,15 @@ def change(action, args):
         try:
             save_rules(proposed)
             save_cache({k: v for k, v in cache.items() if k in new_hosts})
+            if next_balance != previous_balance:
+                save_balance(next_balance)
         except OSError as exc:
             # Restore the previous nft transaction and disk state, best effort.
             try:
                 apply(records, old_cache)
                 save_rules(records)
                 save_cache(old_cache)
+                save_balance(previous_balance)
             except (OSError, PortfwError) as rollback_exc:
                 print(f"CRITICAL: persistence rollback failed: {rollback_exc}", file=sys.stderr)
             raise PortfwError(f"Could not persist change: {exc}") from exc
@@ -361,44 +460,76 @@ def change(action, args):
 
 
 def refresh_dns():
-    # DNS resolution happens OUTSIDE the writer lock; only commit is serialized.
+    """Poll DNS and rotate opted-in domains after interval; never touch nft on no-op."""
     with locked():
         records = read_rules()
         hosts = sorted({r[2] for r in records if is_domain(r[2])})
-        old = read_cache()
+        active_balance = read_balance()
+        old_cache = read_cache()
     if not hosts:
         print("DNS: no domains configured; no firewall changes")
         return
     results = {}
     for host in hosts:
         try:
-            results[host] = resolve(host)
+            # Use every A record only for domains with explicit timed balancing.
+            results[host] = resolve_all(host) if host in active_balance else [resolve(host)]
         except PortfwError as exc:
             print(f"DNS warning: {exc}; keeping last known good IP", file=sys.stderr)
     with locked():
         records = read_rules()
         hosts = {r[2] for r in records if is_domain(r[2])}
         cache = read_cache()
+        balance = read_balance()
+        new_balance = dict(balance)
+        now = int(time.time())
         for host in hosts:
-            if host in results:
-                cache[host] = results[host]
+            if host not in results:
+                continue
+            addresses = results[host]
+            if host in balance:
+                minutes, selected, last = balance[host]
+                # Persisted selected IP is the last committed target.
+                # If a previous update was rolled back, trust the live cache.
+                current = cache.get(host, selected)
+                chosen, next_last = next_rotation(current, addresses, last, minutes, now)
+                cache[host] = chosen
+                new_balance[host] = (minutes, chosen, next_last)
+            else:
+                cache[host] = addresses[0]
         if any(host not in cache for host in hosts):
             raise PortfwError("At least one domain has no valid resolved address")
         new_cache = {k: v for k, v in cache.items() if k in hosts}
         old_active = {k: v for k, v in read_cache().items() if k in hosts}
-        if new_cache == old_active:
+        # Another command may have updated the config during unlocked DNS lookups.
+        # Missing/changed host selection must not overwrite an unrelated state.
+        if new_cache == old_active and new_balance == balance:
             print("DNS: unchanged; firewall untouched")
             return
-        apply(records, new_cache)
+        changed = new_cache != old_active
+        if changed:
+            apply(records, new_cache)
         try:
-            save_cache(new_cache)
+            if changed:
+                save_cache(new_cache)
+            if new_balance != balance:
+                save_balance(new_balance)
         except OSError as exc:
             try:
-                apply(records, old_active)
-            except PortfwError as rollback_exc:
-                print(f"CRITICAL: DNS rollback failed: {rollback_exc}", file=sys.stderr)
-            raise PortfwError(f"Could not persist DNS cache: {exc}") from exc
-        print("DNS: changes applied atomically")
+                if changed:
+                    apply(records, old_active)
+                    save_cache(old_active)
+                save_balance(balance)
+            except (OSError, PortfwError) as rollback_exc:
+                print(f"CRITICAL: DNS rotation rollback failed: {rollback_exc}", file=sys.stderr)
+            raise PortfwError(f"Could not persist DNS cache/balance: {exc}") from exc
+        if changed:
+            for host in sorted(hosts & new_balance.keys()):
+                if new_cache.get(host) != old_active.get(host):
+                    print(f"DNS balance: {host} -> {new_cache[host]}")
+            print("DNS: changes applied atomically")
+        else:
+            print("DNS: balance state updated; firewall untouched")
 
 
 def configure_timer(minutes=None, enable=None):
@@ -741,6 +872,37 @@ def _dns_settings():
             print(_paint(f"ERROR: {exc}", "red"))
 
 
+def _balance_settings():
+    while True:
+        _heading("Timed DNS Balancing", "Rotate NEW connections across A records every N minutes", "cyan")
+        show_balance()
+        _menu_item("1", "Enable / Change", "Select a domain Rule ID; default 5min", "green")
+        _menu_item("2", "Disable", "Keep current destination IP", "yellow")
+        _menu_item("0", "Back", "Return to main menu", "white")
+        option = _prompt("Select option", color="white")
+        if option == "0":
+            return
+        try:
+            if option not in ("1", "2"):
+                raise PortfwError("Invalid menu option")
+            candidates = [r for r in read_rules() if is_domain(r[2])]
+            if not candidates:
+                raise PortfwError("No domain rules exist")
+            list_rules(candidates)
+            selected = _prompt("Rule ID", color="cyan")
+            if not selected.isdecimal():
+                raise PortfwError("Invalid Rule ID")
+            if option == "1":
+                interval = _prompt("Rotation minutes", "5", "cyan")
+                if not interval.isdecimal():
+                    raise PortfwError("Interval must be a number")
+                configure_balance(int(selected), True, int(interval))
+            else:
+                configure_balance(int(selected), False)
+        except PortfwError as exc:
+            print(_paint(f"ERROR: {exc}", "red"))
+
+
 def interactive():
     while True:
         try:
@@ -754,6 +916,7 @@ def interactive():
             _menu_item("6", "Reload Rules", "Reapply native maps and re-detect Primary IP", "magenta")
             _menu_item("7", "DNS Auto Refresh", "Configure background refresh timer", "blue")
             _menu_item("8", "Refresh DNS Now", "Manually resolve domain destinations", "cyan")
+            _menu_item("9", "DNS Timed Balance", "Rotate destination IP for new sessions", "green")
             _menu_item("0", "Exit", "Close the manager", "white")
             print()
             choice = _prompt("Select option", color="white")
@@ -780,9 +943,11 @@ def interactive():
                 _heading("Refresh DNS Now", "Check configured domains and update only if changed", "cyan")
                 refresh_dns()
                 print(_paint("✓ DNS refresh completed.", "green"))
+            elif choice == "9":
+                _balance_settings()
             else:
                 print(_paint("Invalid menu option.", "red"))
-            if choice != "7":
+            if choice not in ("7", "9"):
                 _pause()
         except (EOFError, KeyboardInterrupt):
             print()
@@ -817,15 +982,22 @@ def main():
     group = timer.add_mutually_exclusive_group()
     group.add_argument("--enable", action="store_true")
     group.add_argument("--disable", action="store_true")
+    balance = sub.add_parser("balance")
+    balance.add_argument("--enable", type=int, metavar="RULE_ID")
+    balance.add_argument("--disable", type=int, metavar="RULE_ID")
+    balance.add_argument("--minutes", type=int, choices=INTERVALS, default=5)
     args = parser.parse_args()
     try:
-        if args.action in ("list", "render", "check"):
+        if args.action in ("list", "render", "check") or (args.action == "balance" and args.enable is None and args.disable is None):
             records = read_rules()
             if args.action == "list":
                 list_rules(records)
             elif args.action == "render":
                 print(nft_config(records, read_cache(), "192.0.2.1", existing=False))
+            elif args.action == "balance":
+                show_balance()
             else:
+                read_balance()
                 print("State validation OK")
             return
         if os.geteuid() != 0:
@@ -840,6 +1012,13 @@ def main():
             refresh_dns()
         elif args.action == "timer":
             configure_timer(args.minutes, True if args.enable else False if args.disable else None)
+        elif args.action == "balance":
+            if args.enable is not None and args.disable is not None:
+                raise PortfwError("Choose --enable or --disable, not both")
+            if args.enable is not None:
+                configure_balance(args.enable, True, args.minutes)
+            elif args.disable is not None:
+                configure_balance(args.disable, False)
         elif args.action is None:
             interactive()
         else:

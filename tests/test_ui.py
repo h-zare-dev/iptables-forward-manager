@@ -42,7 +42,7 @@ class NativeMenuTests(unittest.TestCase):
             with contextlib.redirect_stdout(result):
                 ui.print_header(self.sample)
         contents = result.getvalue()
-        for term in ("Port Forward Manager", "nftables v2.0.0-rc3",
+        for term in ("Port Forward Manager", "nftables v2.1.0-rc1",
                      "Host:", "test-de", "Interface:", "eth0",
                      "Primary IPv4:", "91.107.254.25",
                      "Other IPv4:", "91.98.99.74",
@@ -75,6 +75,7 @@ class NativeMenuTests(unittest.TestCase):
              contextlib.redirect_stdout(io.StringIO()) as out:
             ui.interactive()
         self.assertIn("DNS Auto Refresh", out.getvalue())
+        self.assertIn("DNS Timed Balance", out.getvalue())
         self.assertIn("Reload Rules", out.getvalue())
         self.assertIn("Delete All", out.getvalue())
         apply.assert_not_called()

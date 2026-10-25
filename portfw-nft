@@ -459,7 +459,7 @@ def nft_config(records, cache, primary, *, existing=False, balance=None, backend
             lines.append(f"add element ip {TABLE} {portmap} {{ {destinations} }}")
             ipmap = ", ".join(f"{i} : {ip}" for i, ip in enumerate(targets))
             lines.append(
-                f"add rule ip {TABLE} {chain} dnat ip to numgen inc mod {len(targets)} "
+                f"add rule ip {TABLE} {chain} ip protocol {proto} dnat ip to numgen inc mod {len(targets)} "
                 f"map {{ {ipmap} }} : {proto} dport map @{portmap}"
             )
         if rr_rules[proto]:

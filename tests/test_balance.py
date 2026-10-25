@@ -134,7 +134,7 @@ class TimedBalancingTests(unittest.TestCase):
         self.assertEqual(self.refresh(1300), 1)
         fw.configure_balance(1, False)
         self.assertEqual(fw.read_balance(), {})
-        with patch.object(fw, "resolve", return_value=A), \
+        with patch.object(fw, "resolve_all", return_value=[A]), \
              patch.object(fw, "apply") as apply:
             fw.refresh_dns()
             apply.assert_called_once()

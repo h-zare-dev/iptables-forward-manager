@@ -20,8 +20,15 @@ def receiver(ip):
         while True:
             connection, peer = sock.accept()
             with connection:
-                data = connection.recv(128)
-                connection.sendall(f"ACK|{ip}|{peer[0]}|".encode() + data)
+                connection.settimeout(8)
+                while True:
+                    try:
+                        data = connection.recv(128)
+                    except socket.timeout:
+                        break
+                    if not data:
+                        break
+                    connection.sendall(f"ACK|{ip}|{peer[0]}|".encode() + data)
 
 
 def server(flag):
@@ -43,10 +50,33 @@ def probe(ip):
     print(f"PASS: forwarded TCP reached {ip}:{PORT} with expected SNAT")
 
 
+def hold(ip, ready, continue_flag):
+    """Keep the same TCP socket open during nftables destination rotation."""
+    with socket.create_connection((ROUTER, 5001), timeout=4) as sock:
+        def exchange(payload):
+            sock.sendall(payload)
+            got = sock.recv(128)
+            expected = f"ACK|{ip}|{SNAT}|".encode() + payload
+            if got != expected:
+                raise RuntimeError(f"Established flow changed destination: {got!r} != {expected!r}")
+        exchange(b"BEFORE")
+        Path(ready).touch()
+        for _ in range(100):
+            if Path(continue_flag).exists():
+                break
+            time.sleep(0.05)
+        else:
+            raise RuntimeError("Timeout awaiting DNS rotation from test harness")
+        exchange(b"AFTER")
+    print(f"PASS: existing TCP connection stayed on {ip} across destination rotation")
+
+
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "server":
         server(sys.argv[2])
     elif len(sys.argv) == 3 and sys.argv[1] == "probe":
         probe(sys.argv[2])
+    elif len(sys.argv) == 5 and sys.argv[1] == "hold":
+        hold(sys.argv[2], sys.argv[3], sys.argv[4])
     else:
-        sys.exit("Usage: dns_probe.py server READY_FILE | probe DESTINATION_IP")
+        sys.exit("Usage: dns_probe.py server READY_FILE | probe DEST_IP | hold DEST_IP READY CONTINUE")

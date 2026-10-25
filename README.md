@@ -84,6 +84,7 @@ The program rejects overlapping source ports for the same protocol, duplicate po
 - Persistent systemd restore; a **Reload** action detects the current primary IPv4 for SNAT.
 - Managed `ip ifm_portfw` table; no global nftables or conntrack flush. Configuration updates are validated and committed as a batch for the owned table.
 - Optional independent DNS refresh timer with configurable intervals.
+- **Opt-in timed A-record backend rotation** per domain; five-minute alternating targets for newly established sessions, leaving stable routing unchanged by default.
 
 Only **IPv4** is forwarded; IPv6 is shown in the menu for server information.
 
@@ -159,7 +160,7 @@ sudo portfw-nft balance --enable 1 --minutes 5
 sudo portfw-nft timer --minutes 1 --enable
 
 # Read-only selected destination / next rotation info:
-portfw-nft balance
+sudo portfw-nft balance
 
 # Stop automatic switching, retaining the current target until the next
 # normal DNS refresh; future refreshes revert to the default lowest IP:

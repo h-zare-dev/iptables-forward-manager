@@ -243,12 +243,14 @@ class TimedBalancingTests(unittest.TestCase):
         script = fw.nft_config([self.rule, r2], {HOST: A}, "198.51.100.80",
             balance={HOST: (0, A, 1000)}, backends={HOST: [A, B]})
         self.assertIn("numgen inc mod 2", script)
-        self.assertIn("tcp_rr2", script)
-        self.assertIn("udp_rr2", script)
-        self.assertIn("2020 . 0 : 198.51.100.10 . 2020", script)
-        self.assertIn("2020 . 1 : 198.51.100.20 . 2020", script)
+        self.assertIn("tcp_rr_1", script)
+        self.assertIn("udp_rr_1", script)
+        self.assertIn("0 : 198.51.100.10", script)
+        self.assertIn("1 : 198.51.100.20", script)
         self.assertIn("2030 : 198.51.100.77 . 3030", script)
         self.assertIn("198.51.100.20 . 2020 . 2020", script)
+        self.assertIn("2020 : jump tcp_rr_1", script)
+        self.assertIn("type inet_service : verdict;", script)
 
     def test_rr_mode_limit_rejects_mapping_explosion(self):
         src = ",".join(str(x) for x in range(1001, 1002))

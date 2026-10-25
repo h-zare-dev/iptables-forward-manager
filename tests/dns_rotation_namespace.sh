@@ -92,4 +92,28 @@ after="$(ip netns exec "$NSR" nft -a list table ip ifm_portfw)"
 grep -Fxq 'edge.example.net|198.18.12.3' "$TMP/state/dns-cache.db"
 ip netns exec "$NSC" python3 "$ROOT/tests/dns_probe.py" probe 198.18.12.3
 
-echo "PASS: real DNS A-record rotation, unchanged-no-op, failure fallback, TCP delivery and SNAT."
+# Opt-in five-minute DNS rotation across two simultaneously published A records.
+# The controlled test resolver now exposes BOTH A records.
+printf '198.18.12.2\n198.18.12.3\n' > "$TMP/dns-record"
+ip netns exec "$NSR" env PATH="$TMP/bin:$PATH" PORTFW_TEST_DNS_RECORD="$TMP/dns-record" \
+  PORTFW_STATE_DIR="$TMP/state" PORTFW_LOCK="$TMP/lock" python3 "$ROOT/portfw-nft" balance --enable 1 --minutes 5
+grep -q 'edge.example.net|5|198.18.12.3|' "$TMP/state/dns-balance.db"
+# A poll before five minutes must not rewrite the live nftables table.
+before="$(ip netns exec "$NSR" nft -a list table ip ifm_portfw)"
+ip netns exec "$NSR" env PATH="$TMP/bin:$PATH" PORTFW_TEST_DNS_RECORD="$TMP/dns-record" \
+  PORTFW_STATE_DIR="$TMP/state" PORTFW_LOCK="$TMP/lock" python3 "$ROOT/portfw-nft" dns-refresh
+after="$(ip netns exec "$NSR" nft -a list table ip ifm_portfw)"
+[[ "$before" == "$after" ]] || { echo "Rotation happened before the configured interval" >&2; exit 1; }
+# Simulate the passage of five minutes in the isolated test state only.
+sed -i 's/|[0-9][0-9]*$/|0/' "$TMP/state/dns-balance.db"
+ip netns exec "$NSR" env PATH="$TMP/bin:$PATH" PORTFW_TEST_DNS_RECORD="$TMP/dns-record" \
+  PORTFW_STATE_DIR="$TMP/state" PORTFW_LOCK="$TMP/lock" python3 "$ROOT/portfw-nft" dns-refresh
+grep -Fxq 'edge.example.net|198.18.12.2' "$TMP/state/dns-cache.db"
+ip netns exec "$NSC" python3 "$ROOT/tests/dns_probe.py" probe 198.18.12.2
+sed -i 's/|[0-9][0-9]*$/|0/' "$TMP/state/dns-balance.db"
+ip netns exec "$NSR" env PATH="$TMP/bin:$PATH" PORTFW_TEST_DNS_RECORD="$TMP/dns-record" \
+  PORTFW_STATE_DIR="$TMP/state" PORTFW_LOCK="$TMP/lock" python3 "$ROOT/portfw-nft" dns-refresh
+grep -Fxq 'edge.example.net|198.18.12.3' "$TMP/state/dns-cache.db"
+ip netns exec "$NSC" python3 "$ROOT/tests/dns_probe.py" probe 198.18.12.3
+
+echo "PASS: real DNS A-record rotation + 5-minute opt-in two-IP backend balancing, unchanged-no-op, failure fallback, TCP delivery and SNAT."

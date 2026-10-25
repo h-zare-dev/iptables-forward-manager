@@ -43,7 +43,7 @@ cmp /repo/portfw-nft.service /etc/systemd/system/portfw-nft.service
 cmp /repo/portfw-dns-refresh.timer /etc/systemd/system/portfw-dns-refresh.timer
 cmp /repo/portfw-dns-refresh.service /etc/systemd/system/portfw-dns-refresh.service
 [[ -x /usr/local/bin/portfw-nft && -x /usr/local/bin/portfw-migrate ]]
-[[ "$(portfw-nft --version)" == 2.0.0-rc3 ]]
+[[ "$(portfw-nft --version)" == 2.1.0-rc2 ]]
 [[ "$(cat "$PORTFW_INSTALL_SMOKE_SYSTEMCTL")" == "daemon-reload" ]]
 grep -Fxq 'WantedBy=multi-user.target' /etc/systemd/system/portfw-nft.service
 grep -Fxq 'ExecStart=/usr/local/bin/portfw-nft apply' /etc/systemd/system/portfw-nft.service

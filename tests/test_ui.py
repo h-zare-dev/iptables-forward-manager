@@ -42,7 +42,7 @@ class NativeMenuTests(unittest.TestCase):
             with contextlib.redirect_stdout(result):
                 ui.print_header(self.sample)
         contents = result.getvalue()
-        for term in ("Port Forward Manager", "nftables v2.0.0-rc3",
+        for term in ("Port Forward Manager", "nftables v2.1.0-rc2",
                      "Host:", "test-de", "Interface:", "eth0",
                      "Primary IPv4:", "91.107.254.25",
                      "Other IPv4:", "91.98.99.74",
@@ -75,6 +75,7 @@ class NativeMenuTests(unittest.TestCase):
              contextlib.redirect_stdout(io.StringIO()) as out:
             ui.interactive()
         self.assertIn("DNS Auto Refresh", out.getvalue())
+        self.assertIn("DNS Load Balancing", out.getvalue())
         self.assertIn("Reload Rules", out.getvalue())
         self.assertIn("Delete All", out.getvalue())
         apply.assert_not_called()
@@ -117,6 +118,46 @@ class NativeMenuTests(unittest.TestCase):
         with patch.object(ui, "run") as run:
             run.return_value.stdout = "disabled\n"
             self.assertFalse(ui._dns_is_enabled())
+
+    def test_colorful_balancing_menu_configures_timed_per_connection_and_off(self):
+        rule = ui.make_rule(7, "2020", "example.net", "2020", "both")
+        scenarios = (
+            (["1", "7", "2", "5", "y", "0"], True, "timed", 5),
+            (["1", "7", "3", "y", "0"], True, "round-robin", 5),
+            (["1", "7", "1", "y", "0"], False, "timed", 5),
+        )
+        for inputs, enabled, mode, minutes in scenarios:
+            with self.subTest(mode=mode, enabled=enabled), \
+                 patch.object(ui, "read_rules", return_value=[rule]), \
+                 patch.object(ui, "read_balance", return_value={}), \
+                 patch.object(ui, "read_backends", return_value={}), \
+                 patch.object(ui, "read_cache", return_value={"example.net": "192.0.2.5"}), \
+                 patch.object(ui, "_dns_is_enabled", return_value=True), \
+                 patch.object(ui, "_dns_configured_minutes", return_value=1), \
+                 patch.object(ui, "configure_balance") as configure, \
+                 patch.object(ui, "_pause"), \
+                 patch.object(ui, "_prompt", side_effect=inputs), \
+                 patch.dict(os.environ, {"TERM": "dumb"}), \
+                 contextlib.redirect_stdout(io.StringIO()) as out:
+                ui._balance_settings()
+                configure.assert_called_once_with(7, enabled, minutes, mode=mode)
+                rendered = out.getvalue()
+                for expected in ("DNS Load Balancing", "Mode:", "OFF", "TIMED ROTATION",
+                                 "PER-CONNECTION RR", "Rule IDs", "DNS poll timer", "┌", "└"):
+                    self.assertIn(expected, rendered)
+
+    def test_balancing_menu_can_open_dns_timer_settings(self):
+        with patch.object(ui, "read_rules", return_value=[]), \
+             patch.object(ui, "read_balance", return_value={}), \
+             patch.object(ui, "read_backends", return_value={}), \
+             patch.object(ui, "read_cache", return_value={}), \
+             patch.object(ui, "_dns_is_enabled", return_value=False), \
+             patch.object(ui, "_dns_configured_minutes", return_value=5), \
+             patch.object(ui, "_dns_settings") as timer, \
+             patch.object(ui, "_prompt", side_effect=["2", "0"]), \
+             contextlib.redirect_stdout(io.StringIO()):
+            ui._balance_settings()
+            timer.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -8,11 +8,16 @@ TMP="$(mktemp -d)"
 NSC="pfdc$$"; NSR="pfdr$$"; NSD="pfds$$"
 VC="pfdvc$$"; VR="pfdvr$$"; VRO="pfdvo$$"; VD="pfdvd$$"
 SERVER_PID=""
+HOLD_PID=""
 cleanup() {
   set +e
   if [[ -n "$SERVER_PID" ]]; then
     kill "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
+  fi
+  if [[ -n "$HOLD_PID" ]]; then
+    kill "$HOLD_PID" 2>/dev/null || true
+    wait "$HOLD_PID" 2>/dev/null || true
   fi
   for ns in "$NSC" "$NSR" "$NSD"; do ip netns del "$ns" 2>/dev/null || true; done
   rm -rf "$TMP"
@@ -53,7 +58,9 @@ cat > "$TMP/bin/getent" <<'GETENT'
 [[ -f "$PORTFW_TEST_DNS_RECORD" ]] || exit 2
 value="$(cat "$PORTFW_TEST_DNS_RECORD")"
 [[ "$value" == "FAIL" ]] && exit 2
-printf '%s STREAM edge.example.net\n' "$value"
+while IFS= read -r address; do
+  [[ -n "$address" ]] && printf '%s STREAM edge.example.net\n' "$address"
+done <<< "$value"
 GETENT
 chmod 700 "$TMP/bin/getent"
 
@@ -92,4 +99,87 @@ after="$(ip netns exec "$NSR" nft -a list table ip ifm_portfw)"
 grep -Fxq 'edge.example.net|198.18.12.3' "$TMP/state/dns-cache.db"
 ip netns exec "$NSC" python3 "$ROOT/tests/dns_probe.py" probe 198.18.12.3
 
-echo "PASS: real DNS A-record rotation, unchanged-no-op, failure fallback, TCP delivery and SNAT."
+# Opt-in five-minute DNS rotation across two simultaneously published A records.
+# The controlled test resolver now exposes BOTH A records.
+printf '198.18.12.2\n198.18.12.3\n' > "$TMP/dns-record"
+ip netns exec "$NSR" env PATH="$TMP/bin:$PATH" PORTFW_TEST_DNS_RECORD="$TMP/dns-record" \
+  PORTFW_STATE_DIR="$TMP/state" PORTFW_LOCK="$TMP/lock" python3 "$ROOT/portfw-nft" balance --enable 1 --minutes 5
+grep -q 'edge.example.net|5|198.18.12.3|' "$TMP/state/dns-balance.db"
+# A poll before five minutes must not rewrite the live nftables table.
+before="$(ip netns exec "$NSR" nft -a list table ip ifm_portfw)"
+ip netns exec "$NSR" env PATH="$TMP/bin:$PATH" PORTFW_TEST_DNS_RECORD="$TMP/dns-record" \
+  PORTFW_STATE_DIR="$TMP/state" PORTFW_LOCK="$TMP/lock" python3 "$ROOT/portfw-nft" dns-refresh
+after="$(ip netns exec "$NSR" nft -a list table ip ifm_portfw)"
+[[ "$before" == "$after" ]] || { echo "Rotation happened before the configured interval" >&2; exit 1; }
+# Preserve a real established flow to backend .3 while NEW connections move to .2.
+ip netns exec "$NSC" python3 "$ROOT/tests/dns_probe.py" hold 198.18.12.3 \
+  "$TMP/hold-ready" "$TMP/hold-continue" > "$TMP/hold.log" 2>&1 &
+HOLD_PID="$!"
+for _ in {1..50}; do
+  [[ -f "$TMP/hold-ready" ]] && break
+  if ! kill -0 "$HOLD_PID" 2>/dev/null; then
+    cat "$TMP/hold.log"; exit 1
+  fi
+  sleep 0.05
+done
+[[ -f "$TMP/hold-ready" ]] || { echo "Existing connection probe not ready" >&2; exit 1; }
+
+# Simulate the passage of five minutes in the isolated test state only.
+sed -i 's/|[0-9][0-9]*$/|0/' "$TMP/state/dns-balance.db"
+ip netns exec "$NSR" env PATH="$TMP/bin:$PATH" PORTFW_TEST_DNS_RECORD="$TMP/dns-record" \
+  PORTFW_STATE_DIR="$TMP/state" PORTFW_LOCK="$TMP/lock" python3 "$ROOT/portfw-nft" dns-refresh
+grep -Fxq 'edge.example.net|198.18.12.2' "$TMP/state/dns-cache.db"
+ip netns exec "$NSC" python3 "$ROOT/tests/dns_probe.py" probe 198.18.12.2
+touch "$TMP/hold-continue"
+wait "$HOLD_PID" || { cat "$TMP/hold.log"; exit 1; }
+cat "$TMP/hold.log"
+HOLD_PID=""
+sed -i 's/|[0-9][0-9]*$/|0/' "$TMP/state/dns-balance.db"
+ip netns exec "$NSR" env PATH="$TMP/bin:$PATH" PORTFW_TEST_DNS_RECORD="$TMP/dns-record" \
+  PORTFW_STATE_DIR="$TMP/state" PORTFW_LOCK="$TMP/lock" python3 "$ROOT/portfw-nft" dns-refresh
+grep -Fxq 'edge.example.net|198.18.12.3' "$TMP/state/dns-cache.db"
+ip netns exec "$NSC" python3 "$ROOT/tests/dns_probe.py" probe 198.18.12.3
+
+# Switch live forwarding rule to BOTH protocols and opt into per-connection RR.
+# No host firewall change: every operation executes inside $NSR.
+sed -i 's/|tcp$/|both/' "$TMP/state/rules.db"
+ip netns exec "$NSR" env PORTFW_STATE_DIR="$TMP/state" PORTFW_LOCK="$TMP/lock" \
+  python3 "$ROOT/portfw-nft" apply
+ip netns exec "$NSR" env PATH="$TMP/bin:$PATH" PORTFW_TEST_DNS_RECORD="$TMP/dns-record" \
+  PORTFW_STATE_DIR="$TMP/state" PORTFW_LOCK="$TMP/lock" python3 "$ROOT/portfw-nft" \
+  balance --enable 1 --mode round-robin
+grep -q 'edge.example.net|0|198.18.12.3|' "$TMP/state/dns-balance.db"
+grep -Fxq 'edge.example.net|198.18.12.2,198.18.12.3' "$TMP/state/dns-backends.db"
+ip netns exec "$NSR" nft list table ip ifm_portfw | grep -q 'numgen inc mod 2'
+ip netns exec "$NSC" python3 "$ROOT/tests/dns_probe.py" rr tcp
+ip netns exec "$NSC" python3 "$ROOT/tests/dns_probe.py" rr udp
+
+# No-op DNS polls MUST NOT reset numgen state or the nftables table.
+before="$(ip netns exec "$NSR" nft -a list table ip ifm_portfw)"
+ip netns exec "$NSR" env PATH="$TMP/bin:$PATH" PORTFW_TEST_DNS_RECORD="$TMP/dns-record" \
+  PORTFW_STATE_DIR="$TMP/state" PORTFW_LOCK="$TMP/lock" python3 "$ROOT/portfw-nft" dns-refresh
+after="$(ip netns exec "$NSR" nft -a list table ip ifm_portfw)"
+[[ "$before" == "$after" ]] || { echo "No-op DNS poll reset per-flow RR kernel state" >&2; exit 1; }
+
+# Dynamic A-record reduction: seamlessly degrade to a single surviving target.
+printf '198.18.12.2\n' > "$TMP/dns-record"
+ip netns exec "$NSR" env PATH="$TMP/bin:$PATH" PORTFW_TEST_DNS_RECORD="$TMP/dns-record" \
+  PORTFW_STATE_DIR="$TMP/state" PORTFW_LOCK="$TMP/lock" python3 "$ROOT/portfw-nft" dns-refresh
+grep -Fxq 'edge.example.net|198.18.12.2' "$TMP/state/dns-backends.db"
+ip netns exec "$NSC" python3 "$ROOT/tests/dns_probe.py" probe 198.18.12.2
+
+# Reappearance of second backend restores kernel RR.
+printf '198.18.12.2\n198.18.12.3\n' > "$TMP/dns-record"
+ip netns exec "$NSR" env PATH="$TMP/bin:$PATH" PORTFW_TEST_DNS_RECORD="$TMP/dns-record" \
+  PORTFW_STATE_DIR="$TMP/state" PORTFW_LOCK="$TMP/lock" python3 "$ROOT/portfw-nft" dns-refresh
+ip netns exec "$NSC" python3 "$ROOT/tests/dns_probe.py" rr tcp
+
+# OFF mode must remove RR maps safely and return to a single stable target.
+ip netns exec "$NSR" env PORTFW_STATE_DIR="$TMP/state" PORTFW_LOCK="$TMP/lock" \
+  python3 "$ROOT/portfw-nft" balance --disable 1
+if ip netns exec "$NSR" nft list table ip ifm_portfw | grep -q 'numgen inc'; then
+  echo "RR rules still present after disabling balance" >&2; exit 1
+fi
+ip netns exec "$NSC" python3 "$ROOT/tests/dns_probe.py" probe 198.18.12.2
+echo "PASS: per-connection RR two backend distribution, UDP/TCP, DNS changes, OFF restore."
+echo "PASS: real DNS A-record rotation + 5-minute opt-in two-IP backend balancing, unchanged-no-op, failure fallback, TCP delivery and SNAT."

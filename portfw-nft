@@ -15,16 +15,18 @@ import sys
 import tempfile
 import time
 
-VERSION = "2.1.0-rc1"
+VERSION = "2.1.0-rc2"
 STATE_DIR = Path(os.environ.get("PORTFW_STATE_DIR", "/etc/iptables-forward-manager"))
 RULES = STATE_DIR / "rules.db"
 CACHE = STATE_DIR / "dns-cache.db"
 BALANCE = STATE_DIR / "dns-balance.db"
+BACKENDS = STATE_DIR / "dns-backends.db"
 LOCK = Path(os.environ.get("PORTFW_LOCK", "/run/iptables-forward-manager.lock"))
 TABLE = "ifm_portfw"
 INTERVALS = (1, 2, 3, 5, 10, 15, 20, 30, 45, 60)
 MAX_PORTS_PER_RULE = 4096
 MAX_PORTS_TOTAL = 10000
+MAX_RR_MAPPINGS = 50000  # Expanded destination mappings to protect memory and reload time
 DNS_RE = re.compile(r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 PROTOCOLS = {"tcp": ("tcp",), "udp": ("udp",), "both": ("tcp", "udp")}
 
@@ -184,7 +186,7 @@ def save_cache(cache):
 
 
 def read_balance():
-    """Per-domain opt-in timed rotation: minutes, selected IPv4, last switch epoch."""
+    """Opt-in mode: minutes=0 for per-connection RR, else timed minutes."""
     if not BALANCE.exists():
         return {}
     result = {}
@@ -195,7 +197,7 @@ def read_balance():
         host, interval, selected, last = fields
         if not is_domain(destination(host)) or host != destination(host):
             raise PortfwError("Invalid DNS balance domain")
-        if host in result or not interval.isdecimal() or int(interval) not in INTERVALS:
+        if host in result or not interval.isdecimal() or int(interval) not in (0, *INTERVALS):
             raise PortfwError("Invalid or duplicate DNS balance interval")
         if not last.isdecimal():
             raise PortfwError("Invalid DNS balance timestamp")
@@ -207,6 +209,31 @@ def save_balance(config):
     content = "".join(f"{host}|{minutes}|{selected}|{last}\n"
                       for host, (minutes, selected, last) in sorted(config.items()))
     write_atomic(BALANCE, content)
+
+
+def read_backends():
+    """Durable resolver snapshot for RR mode; boot restore never requires DNS."""
+    if not BACKENDS.exists():
+        return {}
+    result = {}
+    for line in BACKENDS.read_text().splitlines():
+        parts = line.split("|")
+        if len(parts) != 2:
+            raise PortfwError("Malformed DNS backend state")
+        host, list_text = parts
+        if not is_domain(destination(host)) or host != destination(host) or host in result:
+            raise PortfwError("Invalid or duplicate backend hostname")
+        values = [ipv4(address) for address in list_text.split(",") if address]
+        if not values or len(values) != len(set(values)) or len(values) > 64:
+            raise PortfwError("Invalid DNS backend list (1-64 distinct addresses)")
+        result[host] = sorted(values, key=lambda x: int(ipaddress.IPv4Address(x)))
+    return result
+
+
+def save_backends(config):
+    content = "".join(f"{host}|{','.join(addresses)}\n"
+                      for host, addresses in sorted(config.items()))
+    write_atomic(BACKENDS, content)
 
 
 @contextlib.contextmanager
@@ -248,9 +275,11 @@ def next_rotation(current, addresses, last, interval, now):
     return addresses[(addresses.index(current) + 1) % len(addresses)], now
 
 
-def configure_balance(rule_id, enable, minutes=5):
-    """Enable/disable round-robin by domain; identical hostnames share selection."""
-    if enable and minutes not in INTERVALS:
+def configure_balance(rule_id, enable, minutes=5, mode="timed"):
+    """Switch modes for a shared DNS host: off, timed or per-connection RR."""
+    if enable and mode not in ("timed", "round-robin"):
+        raise PortfwError("Mode must be timed or round-robin")
+    if enable and mode == "timed" and minutes not in INTERVALS:
         raise PortfwError(f"Allowed intervals in minutes: {INTERVALS}")
     with locked():
         rules = read_rules()
@@ -259,42 +288,94 @@ def configure_balance(rule_id, enable, minutes=5):
             raise PortfwError(f"Rule ID {rule_id} not found")
         host = rule[2]
         if not is_domain(host):
-            raise PortfwError("Timed balancing is available only for domain destinations")
+            raise PortfwError("Balancing is available only for domain destinations")
         config = read_balance()
-        if not enable:
-            config.pop(host, None)
-            save_balance(config)
-            print(f"DNS balancing disabled for {host}; current destination unchanged")
-            return
-        addresses = resolve_all(host)
-        if len(addresses) < 2:
-            raise PortfwError(f"{host} needs at least two A records to enable balancing")
+        old_config = dict(config)
+        backends = read_backends()
+        old_backends = dict(backends)
         cache = read_cache()
         current = cache.get(host)
-        if current not in addresses:
-            raise PortfwError("Current cached IP is not in DNS answers; run dns-refresh before enabling")
-        previous = config.get(host)
-        last = previous[2] if previous and previous[1] == current else int(time.time())
-        config[host] = (minutes, current, last)
-        save_balance(config)
-        print(f"DNS balancing: {host} every {minutes} min; current={current}; A records={', '.join(addresses)}")
-        if not _dns_is_enabled():
-            print("WARNING: DNS refresh timer is disabled. Enable it (recommended: every 1 minute) "
-                  "using 'portfw-nft timer --minutes 1 --enable'.", file=sys.stderr)
+        if not current:
+            raise PortfwError("No cached destination for this domain; run DNS Refresh first")
+        if enable:
+            addresses = resolve_all(host)
+            if len(addresses) < 2:
+                raise PortfwError(f"{host} needs at least two A records to enable balancing")
+            if len(addresses) > 64:
+                raise PortfwError("At most 64 A records are supported for balancing")
+            if current not in addresses:
+                raise PortfwError("Current cached IP is not in DNS answers; run dns-refresh before enabling")
+            previous = config.get(host)
+            interval = minutes if mode == "timed" else 0
+            last = (previous[2] if previous and previous[0] == interval
+                    and previous[1] == current else int(time.time()))
+            config[host] = (interval, current, last)
+            if mode == "round-robin":
+                backends[host] = addresses
+            else:
+                backends.pop(host, None)
+        else:
+            config.pop(host, None)
+            backends.pop(host, None)
+        # Installing/removing a kernel per-flow RR map must be a validated
+        # transaction; never leave persistent mode different from live kernel.
+        kernel_changed = (old_config.get(host, (None,))[0] == 0) != (
+            config.get(host, (None,))[0] == 0)
+        if old_backends.get(host) != backends.get(host):
+            kernel_changed = True
+        if kernel_changed:
+            apply(rules, cache, balance=config, backends=backends)
+        try:
+            save_balance(config)
+            save_backends(backends)
+        except OSError as exc:
+            try:
+                if kernel_changed:
+                    apply(rules, cache, balance=old_config, backends=old_backends)
+                save_balance(old_config)
+                save_backends(old_backends)
+            except (OSError, PortfwError) as rollback_exc:
+                print(f"CRITICAL: balance rollback failed: {rollback_exc}", file=sys.stderr)
+            raise PortfwError(f"Could not persist balance mode: {exc}") from exc
+        if not enable:
+            print(f"DNS balancing OFF for {host}; stable destination={current}")
+        elif mode == "timed":
+            print(f"DNS timed rotation: {host} every {minutes}min; current={current}; "
+                  f"A records={', '.join(addresses)}")
+        else:
+            print(f"DNS per-connection ROUND ROBIN: {host}; "
+                  f"{len(addresses)} backends={', '.join(addresses)}")
+        if enable and not _dns_is_enabled():
+            print("WARNING: DNS poll timer is disabled. For timed rotation, "
+                  "enable it with 'portfw-nft timer --minutes 1 --enable'; "
+                  "for per-connection RR, enable polling to discover A record changes.",
+                  file=sys.stderr)
 
 
 def show_balance():
     config = read_balance()
-    if not config:
-        print("Timed DNS balancing: disabled for all domains")
-        return
     rules = read_rules()
+    all_hosts = sorted({r[2] for r in rules if is_domain(r[2])})
+    backends = read_backends()
+    cache = read_cache()
+    if not all_hosts:
+        print("DNS balancing: no domain forwarding rules configured")
     now = int(time.time())
-    for host, (minutes, current, last) in sorted(config.items()):
-        ids = ",".join(str(r[0]) for r in rules if r[2] == host) or "(no active rule)"
-        remaining = max(0, (minutes * 60 - (now - last) + 59) // 60)
-        print(f"{host} | rule IDs={ids} | current={current} | rotate every {minutes}min "
-              f"| due in ~{remaining}min")
+    for host in all_hosts:
+        ids = ",".join(str(r[0]) for r in rules if r[2] == host)
+        current = cache.get(host, "N/A")
+        if host not in config:
+            print(f"{host} | rule IDs={ids} | mode=OFF | stable={current}")
+            continue
+        minutes, selected, last = config[host]
+        if minutes == 0:
+            targets = backends.get(host, [selected])
+            print(f"{host} | rule IDs={ids} | mode=PER-CONNECTION RR | "
+                  f"backends={len(targets)} | IPs={', '.join(targets)}")
+        else:
+            remaining = max(0, (minutes * 60 - (now - last) + 59) // 60)
+            print(f"{host} | rule IDs={ids} | mode=TIMED | current={current} "
+                  f"| rotate every {minutes}min | due in ~{remaining}min")
     print(f"DNS poll timer: {'enabled' if _dns_is_enabled() else 'DISABLED'}")
 
 

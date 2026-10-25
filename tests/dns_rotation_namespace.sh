@@ -8,11 +8,16 @@ TMP="$(mktemp -d)"
 NSC="pfdc$$"; NSR="pfdr$$"; NSD="pfds$$"
 VC="pfdvc$$"; VR="pfdvr$$"; VRO="pfdvo$$"; VD="pfdvd$$"
 SERVER_PID=""
+HOLD_PID=""
 cleanup() {
   set +e
   if [[ -n "$SERVER_PID" ]]; then
     kill "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
+  fi
+  if [[ -n "$HOLD_PID" ]]; then
+    kill "$HOLD_PID" 2>/dev/null || true
+    wait "$HOLD_PID" 2>/dev/null || true
   fi
   for ns in "$NSC" "$NSR" "$NSD"; do ip netns del "$ns" 2>/dev/null || true; done
   rm -rf "$TMP"
@@ -53,7 +58,9 @@ cat > "$TMP/bin/getent" <<'GETENT'
 [[ -f "$PORTFW_TEST_DNS_RECORD" ]] || exit 2
 value="$(cat "$PORTFW_TEST_DNS_RECORD")"
 [[ "$value" == "FAIL" ]] && exit 2
-printf '%s STREAM edge.example.net\n' "$value"
+while IFS= read -r address; do
+  [[ -n "$address" ]] && printf '%s STREAM edge.example.net\n' "$address"
+done <<< "$value"
 GETENT
 chmod 700 "$TMP/bin/getent"
 
@@ -104,12 +111,29 @@ ip netns exec "$NSR" env PATH="$TMP/bin:$PATH" PORTFW_TEST_DNS_RECORD="$TMP/dns-
   PORTFW_STATE_DIR="$TMP/state" PORTFW_LOCK="$TMP/lock" python3 "$ROOT/portfw-nft" dns-refresh
 after="$(ip netns exec "$NSR" nft -a list table ip ifm_portfw)"
 [[ "$before" == "$after" ]] || { echo "Rotation happened before the configured interval" >&2; exit 1; }
+# Preserve a real established flow to backend .3 while NEW connections move to .2.
+ip netns exec "$NSC" python3 "$ROOT/tests/dns_probe.py" hold 198.18.12.3 \
+  "$TMP/hold-ready" "$TMP/hold-continue" > "$TMP/hold.log" 2>&1 &
+HOLD_PID="$!"
+for _ in {1..50}; do
+  [[ -f "$TMP/hold-ready" ]] && break
+  if ! kill -0 "$HOLD_PID" 2>/dev/null; then
+    cat "$TMP/hold.log"; exit 1
+  fi
+  sleep 0.05
+done
+[[ -f "$TMP/hold-ready" ]] || { echo "Existing connection probe not ready" >&2; exit 1; }
+
 # Simulate the passage of five minutes in the isolated test state only.
 sed -i 's/|[0-9][0-9]*$/|0/' "$TMP/state/dns-balance.db"
 ip netns exec "$NSR" env PATH="$TMP/bin:$PATH" PORTFW_TEST_DNS_RECORD="$TMP/dns-record" \
   PORTFW_STATE_DIR="$TMP/state" PORTFW_LOCK="$TMP/lock" python3 "$ROOT/portfw-nft" dns-refresh
 grep -Fxq 'edge.example.net|198.18.12.2' "$TMP/state/dns-cache.db"
 ip netns exec "$NSC" python3 "$ROOT/tests/dns_probe.py" probe 198.18.12.2
+touch "$TMP/hold-continue"
+wait "$HOLD_PID" || { cat "$TMP/hold.log"; exit 1; }
+cat "$TMP/hold.log"
+HOLD_PID=""
 sed -i 's/|[0-9][0-9]*$/|0/' "$TMP/state/dns-balance.db"
 ip netns exec "$NSR" env PATH="$TMP/bin:$PATH" PORTFW_TEST_DNS_RECORD="$TMP/dns-record" \
   PORTFW_STATE_DIR="$TMP/state" PORTFW_LOCK="$TMP/lock" python3 "$ROOT/portfw-nft" dns-refresh

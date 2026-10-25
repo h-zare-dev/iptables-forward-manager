@@ -29,6 +29,7 @@ class TimedBalancingTests(unittest.TestCase):
         for key, value in (
             ("STATE_DIR", state), ("RULES", state / "rules.db"),
             ("CACHE", state / "dns-cache.db"), ("BALANCE", state / "dns-balance.db"),
+            ("BACKENDS", state / "dns-backends.db"),
             ("LOCK", root / "lock"),
         ):
             p = patch.object(fw, key, value)

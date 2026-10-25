@@ -110,18 +110,18 @@ class StorageAndRefreshTests(unittest.TestCase):
     def test_unchanged_dns_never_rewrites_firewall(self):
         fw.save_rules([fw.make_rule(1, "2001", "edge.example.net", "3001", "tcp")])
         fw.save_cache({"edge.example.net": "192.0.2.50"})
-        with patch.object(fw, "resolve", return_value="192.0.2.50"), patch.object(fw, "apply") as apply:
+        with patch.object(fw, "resolve_all", return_value=["192.0.2.50"]), patch.object(fw, "apply") as apply:
             fw.refresh_dns()
             apply.assert_not_called()
 
     def test_dns_changed_committed_and_old_ip_retained_on_error(self):
         fw.save_rules([fw.make_rule(1, "2001", "edge.example.net", "3001", "tcp")])
         fw.save_cache({"edge.example.net": "192.0.2.50"})
-        with patch.object(fw, "resolve", return_value="198.51.100.22"), patch.object(fw, "apply") as apply:
+        with patch.object(fw, "resolve_all", return_value=["198.51.100.22"]), patch.object(fw, "apply") as apply:
             fw.refresh_dns()
             apply.assert_called_once()
             self.assertEqual(fw.read_cache()["edge.example.net"], "198.51.100.22")
-        with patch.object(fw, "resolve", side_effect=fw.PortfwError("timeout")), patch.object(fw, "apply") as apply:
+        with patch.object(fw, "resolve_all", side_effect=fw.PortfwError("timeout")), patch.object(fw, "apply") as apply:
             fw.refresh_dns()
             apply.assert_not_called()
             self.assertEqual(fw.read_cache()["edge.example.net"], "198.51.100.22")
@@ -202,7 +202,7 @@ class StorageAndRefreshTests(unittest.TestCase):
     def test_all_dns_fail_keeps_old_ip(self):
         fw.save_rules([fw.make_rule(1, "2001", "edge.example.net", "3001", "tcp")])
         fw.save_cache({"edge.example.net": "192.0.2.50"})
-        with patch.object(fw, "resolve", side_effect=fw.PortfwError("DNS failed")):
+        with patch.object(fw, "resolve_all", side_effect=fw.PortfwError("DNS failed")):
             fw.refresh_dns()
         self.assertEqual(fw.read_cache()["edge.example.net"], "192.0.2.50")
 

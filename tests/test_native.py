@@ -129,7 +129,7 @@ class StorageAndRefreshTests(unittest.TestCase):
     def test_failed_commit_keeps_previous_cache(self):
         fw.save_rules([fw.make_rule(1, "2001", "edge.example.net", "3001", "tcp")])
         fw.save_cache({"edge.example.net": "192.0.2.50"})
-        with patch.object(fw, "resolve", return_value="198.51.100.22"), \
+        with patch.object(fw, "resolve_all", return_value=["198.51.100.22"]), \
              patch.object(fw, "apply", side_effect=fw.PortfwError("nft failed")):
             with self.assertRaises(fw.PortfwError):
                 fw.refresh_dns()

@@ -399,17 +399,18 @@ def table_exists():
 
 
 def nft_config(records, cache, primary, *, existing=False, balance=None, backends=None):
-    """Render ONLY program-owned table; static + timed maps and per-flow RR maps."""
+    """Render owned table with O(1) port dispatch into rule-specific kernel RR."""
     validate_rules(records)
     primary = ipv4(primary)
     balance = {} if balance is None else balance
     backends = {} if backends is None else backends
     maps = {"tcp": [], "udp": []}
-    rr_maps = {"tcp": {}, "udp": {}}   # count -> [(port, index, IP, dst_port)]
+    # Each RR rule gets its own numgen expression and its own per-port remap.
+    rr_rules = {"tcp": [], "udp": []}
     fw = {"tcp": set(), "udp": set()}
     snat = {"tcp": set(), "udp": set()}
     rr_total = 0
-    for _, source, target, dest, protocol in records:
+    for rid, source, target, dest, protocol in records:
         selected = cache.get(target) if is_domain(target) else target
         if not selected:
             raise PortfwError(f"No DNS cache for {target}; run dns-refresh first")
@@ -419,20 +420,19 @@ def nft_config(records, cache, primary, *, existing=False, balance=None, backend
         if not targets:
             raise PortfwError(f"No durable backend A records for RR domain {target}")
         targets = sorted({ipv4(x) for x in targets}, key=lambda x: int(ipaddress.IPv4Address(x)))
-        for p in PROTOCOLS[protocol]:
-            for s, d in zip(ports(source), ports(dest)):
-                if rr_enabled and len(targets) > 1:
-                    rr_total += len(targets)
-                    if rr_total > MAX_RR_MAPPINGS:
-                        raise PortfwError(f"Too many expanded RR endpoints; limit {MAX_RR_MAPPINGS}")
-                    rr_maps[p].setdefault(len(targets), []).extend(
-                        (s, i, ip, d) for i, ip in enumerate(targets)
-                    )
-                else:
-                    maps[p].append((s, targets[0], d))
+        mappings = list(zip(ports(source), ports(dest)))
+        for proto in PROTOCOLS[protocol]:
+            if rr_enabled and len(targets) > 1:
+                rr_total += len(targets) * len(mappings)
+                if rr_total > MAX_RR_MAPPINGS:
+                    raise PortfwError(f"Too many expanded RR endpoints; limit {MAX_RR_MAPPINGS}")
+                rr_rules[proto].append((rid, mappings, targets))
+            else:
+                maps[proto].extend((sp, targets[0], dp) for sp, dp in mappings)
+            for sp, dp in mappings:
                 for ip in targets:
-                    fw[p].add((ip, d))
-                    snat[p].add((ip, d, s))
+                    fw[proto].add((ip, dp))
+                    snat[proto].add((ip, dp, sp))
     lines = []
     if existing:
         lines.append(f"delete table ip {TABLE}")
@@ -444,24 +444,32 @@ def nft_config(records, cache, primary, *, existing=False, balance=None, backend
             f"add set ip {TABLE} {proto}_snat {{ type ipv4_addr . inet_service . inet_service; }}",
         ])
         if maps[proto]:
-            values = ", ".join(f"{source} : {ip} . {dest}" for source, ip, dest in sorted(maps[proto]))
+            values = ", ".join(f"{sp} : {ip} . {dp}" for sp, ip, dp in sorted(maps[proto]))
             lines.append(f"add element ip {TABLE} {proto}_dnat {{ {values} }}")
-        for count, entries in sorted(rr_maps[proto].items()):
-            name = f"{proto}_rr{count}"
-            # The port guard avoids failed map lookups for unrelated static ports.
+        if rr_rules[proto]:
+            lines.append(f"add map ip {TABLE} {proto}_rr_dispatch {{ type inet_service : verdict; }}")
+        for rid, mappings, targets in rr_rules[proto]:
+            chain = f"{proto}_rr_{rid}"
+            portmap = f"{proto}_rr_ports_{rid}"
             lines.extend([
-                f"add map ip {TABLE} {name} {{ type inet_service . integer : ipv4_addr . inet_service; }}",
-                f"add set ip {TABLE} {name}_ports {{ type inet_service; }}",
+                f"add chain ip {TABLE} {chain}",
+                f"add map ip {TABLE} {portmap} {{ type inet_service : inet_service; }}",
             ])
-            elements = ", ".join(f"{sp} . {index} : {ip} . {dp}"
-                                 for sp, index, ip, dp in sorted(entries))
-            lines.append(f"add element ip {TABLE} {name} {{ {elements} }}")
-            source_ports = ", ".join(str(x) for x in sorted({a for a, _, _, _ in entries}))
-            lines.append(f"add element ip {TABLE} {name}_ports {{ {source_ports} }}")
+            destinations = ", ".join(f"{sp} : {dp}" for sp, dp in mappings)
+            lines.append(f"add element ip {TABLE} {portmap} {{ {destinations} }}")
+            ipmap = ", ".join(f"{i} : {ip}" for i, ip in enumerate(targets))
+            lines.append(
+                f"add rule ip {TABLE} {chain} dnat ip to numgen inc mod {len(targets)} "
+                f"map {{ {ipmap} }} : {proto} dport map @{portmap}"
+            )
+        if rr_rules[proto]:
+            dispatch = ", ".join(f"{sp} : jump {proto}_rr_{rid}"
+                                 for rid, mappings, _ in rr_rules[proto] for sp, _ in mappings)
+            lines.append(f"add element ip {TABLE} {proto}_rr_dispatch {{ {dispatch} }}")
         if fw[proto]:
-            targets = ", ".join(f"{ip} . {dest}" for ip, dest in sorted(fw[proto]))
+            targets = ", ".join(f"{ip} . {dp}" for ip, dp in sorted(fw[proto]))
             lines.append(f"add element ip {TABLE} {proto}_forward {{ {targets} }}")
-            origins = ", ".join(f"{ip} . {dest} . {sp}" for ip, dest, sp in sorted(snat[proto]))
+            origins = ", ".join(f"{ip} . {dp} . {sp}" for ip, dp, sp in sorted(snat[proto]))
             lines.append(f"add element ip {TABLE} {proto}_snat {{ {origins} }}")
     lines.extend([
         f"add chain ip {TABLE} prerouting {{ type nat hook prerouting priority -101; policy accept; }}",
@@ -471,17 +479,11 @@ def nft_config(records, cache, primary, *, existing=False, balance=None, backend
     ])
     for proto in ("tcp", "udp"):
         if maps[proto]:
-            lines.append(
-                f"add rule ip {TABLE} prerouting fib daddr type local ip protocol {proto} "
-                f"dnat ip addr . port to {proto} dport map @{proto}_dnat"
-            )
-        for count in sorted(rr_maps[proto]):
-            name = f"{proto}_rr{count}"
-            lines.append(
-                f"add rule ip {TABLE} prerouting fib daddr type local ip protocol {proto} "
-                f"{proto} dport @{name}_ports "
-                f"dnat ip addr . port to {proto} dport . numgen inc mod {count} map @{name}"
-            )
+            lines.append(f"add rule ip {TABLE} prerouting fib daddr type local ip protocol {proto} "
+                         f"dnat ip addr . port to {proto} dport map @{proto}_dnat")
+        if rr_rules[proto]:
+            lines.append(f"add rule ip {TABLE} prerouting fib daddr type local ip protocol {proto} "
+                         f"{proto} dport vmap @{proto}_rr_dispatch")
         if fw[proto]:
             lines.extend([
                 f"add rule ip {TABLE} forwarding ct status dnat ip protocol {proto} "

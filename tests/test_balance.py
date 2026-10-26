@@ -30,6 +30,8 @@ class TimedBalancingTests(unittest.TestCase):
             ("STATE_DIR", state), ("RULES", state / "rules.db"),
             ("CACHE", state / "dns-cache.db"), ("BALANCE", state / "dns-balance.db"),
             ("BACKENDS", state / "dns-backends.db"),
+            ("RULE_DNS", state / "dns-rules.json"),
+            ("TIMER_MANAGED", state / "dns-timer-managed"),
             ("LOCK", root / "lock"),
         ):
             p = patch.object(fw, key, value)
@@ -172,7 +174,9 @@ class TimedBalancingTests(unittest.TestCase):
         import argparse
         self.enable()
         with patch.object(fw, "apply"), \
-             patch.object(fw, "resolve", return_value=C):
+             patch.object(fw, "resolve", return_value=C), \
+             patch.object(fw, "resolve_all", return_value=[C]), \
+             patch.object(fw, "_sync_dns_timer"):
             fw.change("edit", argparse.Namespace(id=1, source="2020",
                     target="other.example.net", dest="2020", protocol="both"))
         self.assertEqual(fw.read_balance(), {})

@@ -489,12 +489,13 @@ def table_exists():
     return run(["nft", "list", "table", "ip", TABLE], check=False, timeout=5).returncode == 0
 
 
-def nft_config(records, cache, primary, *, existing=False, balance=None, backends=None):
+def nft_config(records, cache, primary, *, existing=False, balance=None, backends=None, policies=None):
     """Render owned table with O(1) port dispatch into rule-specific kernel RR."""
     validate_rules(records)
     primary = ipv4(primary)
     balance = {} if balance is None else balance
     backends = {} if backends is None else backends
+    policies = {} if policies is None else policies
     maps = {"tcp": [], "udp": []}
     # Each RR rule gets its own numgen expression and its own per-port remap.
     rr_rules = {"tcp": [], "udp": []}
@@ -502,12 +503,16 @@ def nft_config(records, cache, primary, *, existing=False, balance=None, backend
     snat = {"tcp": set(), "udp": set()}
     rr_total = 0
     for rid, source, target, dest, protocol in records:
-        selected = cache.get(target) if is_domain(target) else target
+        policy = validate_policy(policies[rid]) if rid in policies else None
+        selected = (policy["selected"] if policy else
+                    cache.get(target) if is_domain(target) else target)
         if not selected:
             raise PortfwError(f"No DNS cache for {target}; run dns-refresh first")
         selected = ipv4(selected)
-        rr_enabled = is_domain(target) and target in balance and balance[target][0] == 0
-        targets = backends.get(target) if rr_enabled else [selected]
+        rr_enabled = (policy["mode"] == "rr" if policy else
+                      is_domain(target) and target in balance and balance[target][0] == 0)
+        targets = (policy["backends"] if rr_enabled and policy else
+                   backends.get(target) if rr_enabled else [selected])
         if not targets:
             raise PortfwError(f"No durable backend A records for RR domain {target}")
         targets = sorted({ipv4(x) for x in targets}, key=lambda x: int(ipaddress.IPv4Address(x)))
@@ -586,7 +591,7 @@ def nft_config(records, cache, primary, *, existing=False, balance=None, backend
     return "\n".join(lines) + "\n"
 
 
-def apply(records, cache, *, balance=None, backends=None):
+def apply(records, cache, *, balance=None, backends=None, policies=None):
     if legacy_active():
         raise PortfwError("Legacy IFM_DNAT jump is active. Refusing overlapping NAT. Perform a controlled maintenance migration.")
     if not shutil.which("nft"):
@@ -596,8 +601,10 @@ def apply(records, cache, *, balance=None, backends=None):
         balance = read_balance()
     if backends is None:
         backends = read_backends()
+    if policies is None:
+        policies = read_rule_dns()
     script = nft_config(records, cache, primary, existing=table_exists(),
-                        balance=balance, backends=backends)
+                        balance=balance, backends=backends, policies=policies)
     run(["sysctl", "-w", "net.ipv4.ip_forward=1"], timeout=5)
     run(["nft", "-c", "-f", "-"], input=script, timeout=15)
     run(["nft", "-f", "-"], input=script, timeout=15)

@@ -1110,11 +1110,83 @@ def _entry(existing=None):
     return source, target, dest, proto
 
 
+def _rule_dns_form(rule_id, target, existing=None):
+    """All balancing and refresh controls appear in the Add/Edit workflow."""
+    if not is_domain(target):
+        print(_paint("IPv4 destination: DNS updates and balancing not required.", "dim"))
+        return None
+    addresses = resolve_all(target)
+    old = existing or {}
+    poll = old.get("poll", 5)
+    rotation = old.get("rotate", 5)
+    mode = old.get("mode", "off")
+    if len(addresses) < 2:
+        mode = "off"
+    _heading("Destination DNS", "Automatically managed for this rule", "cyan")
+    _panel_border("┌", "─", "┐")
+    _panel_row("Domain", target)
+    _panel_row("IPv4 A records", len(addresses), "green")
+    _panel_row("Addresses", ", ".join(addresses), "white")
+    _panel_border("└", "─", "┘")
+    if len(addresses) >= 2:
+        print()
+        _menu_item("1", "Single IP (OFF)", "Default: stable selection; DNS still updates", "white")
+        _menu_item("2", "Timed Rotation", "Rotate NEW connections after each time slot", "cyan")
+        _menu_item("3", "Per-Connection RR", "Distribute new flows natively in kernel", "green")
+        options = {"off": "1", "timed": "2", "rr": "3"}
+        selected = _prompt("Traffic Distribution", options[mode], "yellow")
+        if selected not in ("1", "2", "3"):
+            raise PortfwError("Choose a valid traffic distribution mode")
+        mode = {"1": "off", "2": "timed", "3": "rr"}[selected]
+    else:
+        print(_paint("Only one IP found: Single IP mode (no balancing).", "yellow"))
+    if mode == "timed":
+        value = _prompt("Rotation interval (minutes)", str(rotation), "cyan")
+        if not value.isdecimal() or int(value) not in INTERVALS:
+            raise PortfwError(f"Allowed rotation intervals: {INTERVALS}")
+        rotation = int(value)
+    default_poll = 1 if mode == "timed" else 5
+    if old and old.get("mode") == mode:
+        default_poll = poll
+    print(_paint(f"DNS Updates: AUTO / every {default_poll} min", "green"))
+    customize = _prompt("Customize DNS refresh? (y/N)", "N", "cyan")
+    if customize.lower() in ("y", "yes"):
+        value = _prompt("DNS refresh minutes", str(default_poll), "cyan")
+        if not value.isdecimal() or int(value) not in INTERVALS:
+            raise PortfwError(f"Allowed DNS refresh intervals: {INTERVALS}")
+        poll = int(value)
+    else:
+        poll = default_poll
+    return dict(dns_mode=mode, dns_poll=poll, dns_rotate=rotation,
+                dns_addresses=addresses)
+
+
+def _confirm_rule(source, target, dest, proto, dns):
+    _heading("Review Forwarding Rule", "Validate all settings before applying", "magenta")
+    _panel_border("┌", "─", "┐")
+    _panel_row("Source port(s)", source)
+    _panel_row("Destination", target)
+    _panel_row("Destination port(s)", dest)
+    _panel_row("Protocol", proto.upper(), "green")
+    if dns:
+        labels = {"off": "Single IP (OFF)", "timed": f"Timed / {dns['dns_rotate']} min",
+                  "rr": "Per-Connection RR"}
+        _panel_row("Traffic Distribution", labels[dns["dns_mode"]], "cyan")
+        _panel_row("DNS Updates", f"AUTO / {dns['dns_poll']} min", "green")
+    _panel_border("└", "─", "┘")
+    return _prompt("Save and apply? (Y/n)", "Y", "yellow").lower() in ("y", "yes")
+
+
 def _add():
-    _heading("Add Forwarding", "Create an IPv4 destination with single/range/list ports", "green")
+    _heading("Add Forwarding", "Configure forwarding, DNS and balancing together", "green")
     source, target, dest, proto = _entry()
-    change("add", argparse.Namespace(source=source, target=target, dest=dest, protocol=proto))
-    print(_paint("✓ Rule added successfully.", "green"))
+    options = _rule_dns_form(None, target)
+    if not _confirm_rule(source, target, dest, proto, options):
+        print(_paint("Cancelled. No changes made.", "yellow"))
+        return
+    change("add", argparse.Namespace(source=source, target=target, dest=dest,
+                                     protocol=proto, **(options or {})))
+    print(_paint("✓ Rule, DNS updates and balancing configured successfully.", "green"))
 
 
 def _choose_id(records, action):
@@ -1128,13 +1200,22 @@ def _choose_id(records, action):
 
 
 def _edit():
-    _heading("Edit Forwarding", "Press Enter to keep each existing value", "yellow")
+    _heading("Edit Forwarding", "Ports, destination, DNS updates and balancing", "yellow")
     records = read_rules()
     id_ = _choose_id(records, "edit")
     selected = next(row for row in records if row[0] == id_)
     source, target, dest, proto = _entry((selected[1], selected[2], selected[3], selected[4]))
-    change("edit", argparse.Namespace(id=id_, source=source, target=target, dest=dest, protocol=proto))
-    print(_paint(f"✓ Rule {id_} updated.", "green"))
+    existing = read_rule_dns().get(id_)
+    if is_domain(target) and existing is None and target == selected[2]:
+        existing = legacy_policy(selected, read_balance(), read_backends(),
+                                 read_cache(), _dns_configured_minutes())
+    options = _rule_dns_form(id_, target, existing)
+    if not _confirm_rule(source, target, dest, proto, options):
+        print(_paint("Cancelled. No changes made.", "yellow"))
+        return
+    change("edit", argparse.Namespace(id=id_, source=source, target=target,
+                                      dest=dest, protocol=proto, **(options or {})))
+    print(_paint(f"✓ Rule {id_} and DNS settings updated.", "green"))
 
 
 def _delete():

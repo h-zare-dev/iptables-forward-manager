@@ -191,6 +191,35 @@ class RuleFirstDNSTests(unittest.TestCase):
             fw.read_rule_dns()
 
 
+class DNSAutomanagementTests(unittest.TestCase):
+    def test_scheduler_is_auto_enabled_once_for_domain_rules(self):
+        import subprocess
+        domain_rule = fw.make_rule(1, "2020", HOST, "2020", "tcp")
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(fw, "TIMER_MANAGED", Path(tmp) / "owned"), \
+             patch.object(fw, "_dns_is_enabled", side_effect=[False, True]), \
+             patch.object(fw, "_dns_configured_minutes", return_value=5), \
+             patch.object(fw, "configure_timer") as timer, \
+             patch.object(fw, "run", return_value=subprocess.CompletedProcess([], 0, "inactive", "")):
+            fw._sync_dns_timer([domain_rule])
+            self.assertEqual(timer.call_args_list[0].args, (1, None))
+            self.assertEqual(timer.call_args_list[1].args, (None, True))
+            self.assertTrue(fw.TIMER_MANAGED.exists())
+            fw._sync_dns_timer([])
+            self.assertFalse(fw.TIMER_MANAGED.exists())
+            self.assertEqual(timer.call_args_list[-1].args, (None, False))
+
+    def test_manual_disabling_cannot_break_domain_auto_refresh(self):
+        domain_rule = fw.make_rule(1, "2020", HOST, "2020", "tcp")
+        with patch.object(fw, "read_rules", return_value=[domain_rule]), \
+             patch.object(fw, "run") as run:
+            with self.assertRaisesRegex(fw.PortfwError, "managed automatically"):
+                fw.configure_timer(enable=False)
+            with self.assertRaisesRegex(fw.PortfwError, "fixed at 1 minute"):
+                fw.configure_timer(minutes=5)
+            run.assert_not_called()
+
+
 class ColorfulMenuTests(unittest.TestCase):
     def test_single_ip_skips_mode_menu(self):
         with patch.object(fw, "resolve_all", return_value=[A]), \

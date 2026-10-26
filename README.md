@@ -25,16 +25,16 @@ curl -fsSL https://raw.githubusercontent.com/h-zare-dev/iptables-forward-manager
 sudo portfw-nft
 ```
 
-**4. Add your first rule:** choose **[1] Add Forwarding**, then enter the source port, destination IPv4 (or domain), destination port, and protocol (`tcp`, `udp`, or `both`). **The rule is applied immediately, and the first successful add automatically enables `portfw-nft.service` for future boots.** You do not need to run `systemctl enable --now` manually.
+**4. Add your first rule:** choose **[1] Add Forwarding**, then enter the source port, destination IPv4 (or domain), destination port, and protocol (`tcp`, `udp`, or `both`). **For a domain**, the *same Add form* resolves the A records, offers OFF / Timed Rotation / Per-Connection RR when multiple IPs exist, and shows **DNS Updates: AUTO** (5-minute default for OFF or RR, 1-minute default for Timed). You can customize the interval in the same form. No manual DNS timer setup or separate balancing screen is required. Review and confirm to save. The first successful add enables `portfw-nft.service` for future boots.
 
-That's it. Test connectivity from an external client, and open the menu any time with `sudo portfw-nft`. You can optionally check boot persistence with `systemctl is-enabled portfw-nft.service`. If automatic enable fails, the program warns you; the forwarding rule remains active, but persistence needs attention.
+That's it. Test connectivity from an external client, and open the menu any time with `sudo portfw-nft`. You can optionally check boot persistence with `systemctl is-enabled portfw-nft.service`. If boot restore enable fails, the program warns you; the forwarding rule remains active, but persistence needs attention. DNS timer activation is different: on new domain rule creation, a DNS timer failure is treated as an unsuccessful transaction, with best-effort rollback.
 
 > **Already running the old `portfw` / iptables version?** Don't perform the fresh-install activation on top of it. Use the [upgrade and migration instructions](#moving-from-legacy-iptables-v110) near the end of this README.
 
 ## Menu and basic usage
 
 ```text
-Port Forward Manager | Native nftables v2.1.0-rc2
+Port Forward Manager | Native nftables v2.1.0-rc3
 
 [1] Add Forwarding       Create a new forwarding rule
 [2] Edit Forwarding      Modify an existing rule
@@ -42,9 +42,8 @@ Port Forward Manager | Native nftables v2.1.0-rc2
 [4] List Forwarding      Show all managed rules
 [5] Delete All           Remove all managed forwarding rules
 [6] Reload Rules         Reapply native maps and re-detect Primary IP
-[7] DNS Auto Refresh     Configure background refresh timer
-[8] Refresh DNS Now      Manually resolve domain destinations
-[9] DNS Load Balancing   OFF / Timed / Per-Connection RR
+[7] DNS Settings         Advanced scheduler status and repair
+[8] Refresh DNS Now      Check the DNS of existing domain rules
 [0] Exit                 Close the manager
 ```
 
@@ -83,8 +82,8 @@ The program rejects overlapping source ports for the same protocol, duplicate po
 - Incoming matching on any currently local IPv4 address, including **primary and floating/secondary IPs**. Forwarding configuration is independent of a Floating IP manager.
 - Persistent systemd restore; a **Reload** action detects the current primary IPv4 for SNAT.
 - Managed `ip ifm_portfw` table; no global nftables or conntrack flush. Configuration updates are validated and committed as a batch for the owned table.
-- Optional independent DNS refresh timer with configurable intervals.
-- **Opt-in three-mode DNS load balancing** per domain: OFF (default), Timed Rotation (5-minute IP slots), or Per-Connection Round Robin (native kernel numgen).
+- A single self-managed systemd DNS scheduler, with **independent per-rule DNS intervals** and safe time-window rotation.
+- **Three load distribution modes in Add/Edit**, per forwarding rule: OFF (default), Timed Rotation, or Per-Connection Round Robin (kernel numgen).
 
 Only **IPv4** is forwarded; IPv6 is shown in the menu for server information.
 
@@ -109,81 +108,57 @@ To remove **all managed forwarding entries**: `sudo portfw-nft clear` (or menu o
 
 `portfw-nft render` is for **preview/dry-run only**, with an illustrative SNAT IPv4. **Don't load its rendered output directly into the live firewall.** Replace the example destination addresses in CLI samples with actual reachable hosts.
 
-## Domain destinations and optional DNS refresh
+## Rule-first DNS updates and balancing (v2.1.0-rc3)
 
-A hostname can be used in place of a destination IPv4:
+All routine configuration lives inside **[1] Add Forwarding** and **[2] Edit Forwarding**. No one needs to activate a separate balancing menu or remember to enable a timer.
 
-```bash
-sudo portfw-nft add '1010' edge.example.net '2096' both
-```
+**Adding an IPv4 address:** only the ordinary source port, destination, protocol and final confirmation are shown; no DNS questions.
 
-- Adding a domain resolves its IPv4 **A record** and caches the selected IPv4; an invalid or unresolvable domain is rejected.
-- **Default (unchanged):** when a hostname has multiple A records, use the numerically lowest eligible IP; no balancing until explicitly enabled.
-- **Opt-in timed backend rotation:** for a domain rule, alternate the selected A-record IP every configured interval (default 5 min) when the DNS timer next runs. This is **time-slot distribution of new flows, not equal bandwidth distribution**.
-- Proxied DNS services may return a proxy IP rather than an origin.
-- AAAA-only/IPv6 destinations aren't supported.
-- Existing conntrack sessions aren't moved to a newly resolved destination.
-- DNS lookups run outside the packet path; an unchanged or failed lookup doesn't replace the current valid mapping.
+**Adding a hostname with one A record:** choose the destination as usual. The form displays the resolved IPv4, automatically selects **Single IP (OFF)** and **DNS Updates: AUTO / 5 minutes**. You may optionally customize that interval. OFF does **not** disable DNS updates. If the selected IP disappears from DNS, the scheduler chooses a remaining valid address and applies it.
 
-Refresh manually:
+**Adding a hostname with multiple A records:** the same form displays how many backend addresses were found, then offers:
+
+| Distribution | DNS Updates default | How it works |
+|---|---|---|
+| **[1] Single IP (OFF)** | AUTO / **5 minutes** | One selected backend, no balancing. The IP is followed on DNS changes. |
+| **[2] Timed Rotation** | AUTO / **1 minute** | Change the destination for *new* connections every N minutes (default **5**). |
+| **[3] Per-Connection RR** | AUTO / **5 minutes** | Select the next backend for every new TCP/UDP conntrack flow in the nftables kernel. |
+
+The screen also offers **Customize DNS refresh? [y/N]**. Press Enter to accept the sensible default without filling out another settings page. Timed Rotation separately asks for rotation interval; polling interval and rotation interval are distinct settings.
+
+A final colored, boxed **Review Forwarding Rule** page shows ports, destination, protocol, balancing mode, and automatic DNS interval. Nothing is committed until **Save and apply** is confirmed. If nftables validation or required DNS scheduler activation fails, the Add/Edit operation reports failure and attempts to restore the previous configuration.
+
+**Edit** shows the same form, retaining the Rule's existing distribution and DNS update interval as defaults. Different rules pointing to **the same hostname** can use independent OFF, Timed, or RR modes and independent refresh settings.
+
+**DNS engine:** one `portfw-dns-refresh.timer` schedules `portfw-nft dns-refresh` every minute. The program enables and starts this timer automatically when domain rules exist; individual domain rules are only resolved after their *own* saved polling interval. Timed rotation can use the last known good backend list between DNS polls. If all domains are deleted, it disables the timer **only if that timer was originally auto-enabled by the manager**, rather than overriding an existing user-managed timer. DNS failures preserve the previous known-good backend.
+
+**DNS TTL** is different from the refresh period: DNS resolver caches can make Cloudflare changes visible later. There is no health check or downtime failover; a published but unreachable A record still receives traffic. OFF, Timed and RR do **not** guarantee equal bandwidth. Existing conntrack TCP connections retain their established NAT mappings during a change; UDP state has a finite lifetime.
+
+**Safety:** only IPv4 A records are used; AAAA-only destinations are unsupported. At most 64 resolved IPv4 addresses and 50,000 expanded RR endpoints can be loaded. All state files use root-only 0600 permissions. Changing or adding a domain requires successful resolution; the timer never performs DNS lookups inside the packet path. Unchanged addresses and time slots do not replace nftables rules.
+
+### Advanced controls
+
+**[7] DNS Settings** now shows per-rule modes, intervals, shared scheduler status and a repair action. It is not a second mandatory setup screen. **[8] Refresh DNS Now** manually checks due domain updates; existing CLI commands remain for advanced automation:
 
 ```bash
 sudo portfw-nft dns-refresh
-```
-
-Or optionally enable the independent systemd timer (installed **disabled**, default **5 minutes**):
-
-```bash
-sudo portfw-nft timer --minutes 5 --enable
-sudo portfw-nft timer --minutes 30
-sudo portfw-nft timer --disable
-```
-
-Menu options **7** and **8** provide the same timer configuration/manual refresh. Available intervals in minutes: **1, 2, 3, 5, 10, 15, 20, 30, 45, 60**. Timing is approximate rather than aligned to the clock minute.
-
-### DNS Balancing - three modes, 100% terminal menu (v2.1.0-rc2)
-
-Choose **[9] DNS Load Balancing** from the original colorful terminal UI. Each domain has a dedicated framed status panel: its Rule ID(s), current mode, selected IP or backend list, DNS timer state, and (for timed mode) the approximate next switch. Select **Configure Rule Mode**, pick an existing domain Rule ID, then:
-
-| Mode | Behavior | DNS timer needed? |
-|---|---|---|
-| **OFF (default)** | One stable selected IPv4; existing behavior, no balancing | Only if you want dynamic DNS updates |
-| **TIMED ROTATION** | Every configured N minutes, change the destination for **new connections only**: IP A → B → C → A | **Yes**; poll timer should be shorter than switch interval |
-| **PER-CONNECTION ROUND ROBIN** | Each **new TCP/UDP conntrack flow** alternates across all currently discovered IPv4 addresses using nftables kernel `numgen inc` | No for packet distribution; **yes** to periodically discover A-record changes |
-
-**Your two IPs:** with 5-minute Timed Rotation, all new flows use `57.131.133.117` for one slot, then `57.131.144.149` for the next. With Per-Connection RR, new connections alternate between both backends on the same public forwarding port, without waiting for a 5-minute boundary. **With 10 stable A records**, Timed rotates through all 10 in about 50 minutes; Per-Connection RR cycles through all 10 as new flows arrive. Some DNS resolvers return only subsets of published A records; the manager balances only what `getent ahostsv4` currently returns.
-
-The colored terminal menu has **full status/selection/confirmation flows**, not CLI-only switches. CLI remains available for automation:
-
-```bash
-# Timed rotation: advance selected IP every ~5 minutes
-sudo portfw-nft balance --enable 1 --mode timed --minutes 5
-
-# Alternative: native per-connection Round Robin (no timer wait per packet)
-sudo portfw-nft balance --enable 1 --mode round-robin
-
-# Restore legacy stable behavior
-sudo portfw-nft balance --disable 1
-
-# View per-domain mode and destination(s)
 sudo portfw-nft balance
-
-# The one timer checks A records and drives timed rotation; 1-minute polling
-# is recommended to detect an expired five-minute slot promptly.
-sudo portfw-nft timer --minutes 1 --enable
+sudo portfw-nft balance --enable 1 --mode round-robin
+sudo portfw-nft balance --enable 1 --mode timed --minutes 5
+sudo portfw-nft balance --disable 1
 ```
 
-**Timer versus Cloudflare TTL:** TTL sets recursive DNS caching, not balancing interval. The timer runs `portfw-nft dns-refresh` at its configured cadence. For Timed, it advances the target **only when the timed slot expires**; for Per-Connection RR, forwarding and selection happen entirely in the kernel on each new flow, while DNS polls only update the destination list if it changes. Unchanged and failed DNS responses leave the kernel map and existing connections untouched.
+A one-minute timer tick is required for independent per-rule schedules. Do **not** manually disable the DNS timer while domain rules are active. The manager's Add/Edit flow automatically repairs activation; after a manual change to timer state, use [7] → Repair Scheduler.
 
-**Safety & persistence:** nftables NAT normally evaluates the translation on the first packet of a tracked flow; established TCP connections retain their destination on a map change, as confirmed in real isolated kernel tests. No conntrack flush, other firewall table flush, packet-processing Python loop, service restart, or coupling to a Floating IP manager. Mode and last selected IP are persisted in `dns-balance.db`; for Per-Connection mode the backend snapshot is persisted in `dns-backends.db` for DNS-independent boot restore. Both are root-only (0600), and any `nft -c` rejection aborts a change before persistence. Domain rules sharing the same hostname share mode and selection.
+### Upgrade from rc2
 
-**Operational limits:** time-slot rotation **does not** guarantee 50/50 byte volume; Per-Connection RR distributes new conntrack sessions more evenly, but also cannot ensure equal bandwidth when flows vary in size. DNS A records are **not health checks**: an unhealthy backend still receives flows while published. Timed slots are approximate due to systemd timer scheduling and resolver caching; an RR kernel sequence can restart on explicit ruleset rebuild or DNS backend changes. Active UDP mappings survive only as long as their conntrack entries remain valid. Cap of **64 distinct A records** and **50,000 expanded RR endpoint mappings** to prevent excessive kernel resources. Always test packet drops, jitter and long-lived flows on staging before production.
+Existing `rules.db`, `dns-cache.db`, `dns-balance.db` and `dns-backends.db` remain readable without destructive migration. Older domain balancing rules continue to use their original settings until explicitly edited. The **first Add/Edit in the new UI** creates per-rule state in `dns-rules.json`; editing an existing domain pre-fills its legacy mode and preserves its current target where possible. Deleting unused rules prunes their new state. No automatic activation of existing DNS rules occurs solely by installing the newer binary; open the existing Rule in **Edit** (review and save) to opt into fully automatic per-rule scheduling.
 
-> **Rollout:** This release-candidate feature is opt-in and does not automatically deploy or activate on existing servers. No direct changes to `main`, `development`, GRE or Ansible hosts until owner approves.
+> **Release candidate:** test in staging, including long-lived sessions, DNS failures, packet loss, latency and throughput, before making changes to live traffic. Merge only after the repository owner approves.
 
 ## Service, persistence, and troubleshooting
 
-The native service `portfw-nft.service` restores the managed rules at boot, after network-online. State is stored in `/etc/iptables-forward-manager/rules.db`; domain cache in `/etc/iptables-forward-manager/dns-cache.db`; opt-in balancing state in `/etc/iptables-forward-manager/dns-balance.db`, and the per-connection backend snapshot in `/etc/iptables-forward-manager/dns-backends.db` (both mode 0600).
+The native service `portfw-nft.service` restores the managed rules at boot, after network-online. State is stored in `/etc/iptables-forward-manager/rules.db`; domain cache in `/etc/iptables-forward-manager/dns-cache.db`; new per-rule DNS policy in `/etc/iptables-forward-manager/dns-rules.json` (0600). Legacy `dns-balance.db` and `dns-backends.db` remain readable for safe upgrades.
 
 For a fresh native installation, the installer deliberately **doesn't start or enable** the service. After the **first successful Add Forwarding**, the program enables boot restoration automatically using `systemctl enable portfw-nft.service` (without reapplying the active kernel rules). If this step fails, it prints a warning; check `systemctl is-enabled portfw-nft.service` and the service permissions. If the **primary IPv4 changes**, run `sudo portfw-nft reload` to update the SNAT source. Secondary/floating IPv4s are matched when the kernel considers them local.
 

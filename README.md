@@ -34,7 +34,7 @@ That's it. Test connectivity from an external client, and open the menu any time
 ## Menu and basic usage
 
 ```text
-Port Forward Manager | Native nftables v2.1.0-rc3
+Port Forward Manager | Native nftables v2.1.0
 
 [1] Add Forwarding       Create a new forwarding rule
 [2] Edit Forwarding      Modify an existing rule
@@ -46,6 +46,8 @@ Port Forward Manager | Native nftables v2.1.0-rc3
 [8] Refresh DNS Now      Check the DNS of existing domain rules
 [0] Exit                 Close the manager
 ```
+
+When Per-Connection RR is selected, nftables uses `tcp_rr_dispatch` / `udp_rr_dispatch` and per-rule `numgen` chains. The ordinary `tcp_dnat` / `udp_dnat` maps may be empty for RR-only rules; inspect `sudo nft list table ip ifm_portfw` instead.
 
 The colored dashboard displays **hostname, interface, primary IPv4, secondary/floating IPv4, IPv6 (display only), and rule count**. Add/Edit let you keep existing values by pressing Enter; destructive menu operations require confirmation.
 
@@ -108,7 +110,7 @@ To remove **all managed forwarding entries**: `sudo portfw-nft clear` (or menu o
 
 `portfw-nft render` is for **preview/dry-run only**, with an illustrative SNAT IPv4. **Don't load its rendered output directly into the live firewall.** Replace the example destination addresses in CLI samples with actual reachable hosts.
 
-## Rule-first DNS updates and balancing (v2.1.0-rc3)
+## Rule-first DNS updates and balancing (v2.1.0)
 
 All routine configuration lives inside **[1] Add Forwarding** and **[2] Edit Forwarding**. No one needs to activate a separate balancing menu or remember to enable a timer.
 
@@ -138,7 +140,7 @@ A final colored, boxed **Review Forwarding Rule** page shows ports, destination,
 
 ### Advanced controls
 
-**[7] DNS Settings** now shows per-rule modes, intervals, shared scheduler status and a repair action. It is not a second mandatory setup screen. **[8] Refresh DNS Now** manually checks due domain updates; existing CLI commands remain for advanced automation:
+**[7] DNS Settings** shows per-rule modes, intervals, shared scheduler status and a repair action; it is not a separate required setup screen. **[8] Refresh DNS Now** runs the DNS refresh worker immediately, but each modern rule is still re-resolved only when its configured polling interval is due. Existing CLI commands remain for advanced automation:
 
 ```bash
 sudo portfw-nft dns-refresh
@@ -150,11 +152,11 @@ sudo portfw-nft balance --disable 1
 
 A one-minute timer tick is required for independent per-rule schedules. Do **not** manually disable the DNS timer while domain rules are active. The manager's Add/Edit flow automatically repairs activation; after a manual change to timer state, use [7] → Repair Scheduler.
 
-### Upgrade from rc2
+### Upgrading from earlier 2.1.x release candidates
 
-Existing `rules.db`, `dns-cache.db`, `dns-balance.db` and `dns-backends.db` remain readable without destructive migration. Older domain balancing rules continue to use their original settings until explicitly edited. The **first Add/Edit in the new UI** creates per-rule state in `dns-rules.json`; editing an existing domain pre-fills its legacy mode and preserves its current target where possible. Deleting unused rules prunes their new state. No automatic activation of existing DNS rules occurs solely by installing the newer binary; open the existing Rule in **Edit** (review and save) to opt into fully automatic per-rule scheduling.
+Existing `rules.db`, `dns-cache.db`, `dns-balance.db` and `dns-backends.db` remain readable without destructive migration. Older domain balancing rules continue to use their original settings until explicitly edited. Adding or explicitly editing a domain rule through the new UI writes that rule's policy to `dns-rules.json`; editing an existing domain pre-fills its legacy mode and preserves its current target where possible. Deleting unused rules prunes their new state. No automatic activation of existing DNS rules occurs solely by installing the newer binary; open the existing Rule in **Edit** (review and save) to opt into fully automatic per-rule scheduling.
 
-> **Release candidate:** test in staging, including long-lived sessions, DNS failures, packet loss, latency and throughput, before making changes to live traffic. Merge only after the repository owner approves.
+> **Production note:** v2.1.0 is the stable release version, but software updates are not a guarantee of zero packet loss or jitter. Test connection handling, DNS changes and rollback plans before deploying to busy forwarding servers.
 
 ## Service, persistence, and troubleshooting
 
@@ -181,9 +183,9 @@ The service can report `active (exited)`: this is normal for its `oneshot`/persi
 
 This repository uses **`development` as the default branch**. The normal flow is `feature/*` → PR to `development` → CI/manual test → owner-reviewed PR to `main`.
 
-GitHub Actions **Quality** and **Shell syntax** cover parsing and invalid cases, UI, migration ordering, DNS-cache behavior, nftables dry runs, and real TCP/UDP forwarding + SNAT in isolated network namespaces. Manual `test-de` testing included migration, native maps, range/list creation and validation. These do **not** certify every firewall setup, low jitter under all loads, or zero-packet-loss cutovers.
+GitHub Actions **Quality** and **Shell syntax** cover parsing and invalid cases, UI, migration ordering, DNS-cache behavior, nftables dry runs, and real TCP/UDP forwarding + SNAT in isolated network namespaces. Manual staging included legacy cutover and range/list validation on `test-de`, plus rule-first Add/Edit, automatic DNS scheduling, timed rotation, TCP kernel RR distribution and return SYN-ACK replies from all three DNS backends on `ip-tun05`. A separate 60-connection TCP probe via the forwarder succeeded 60/60 from `reycloud-ir02`. These results **do not** establish loss-free behavior, consistently low jitter, or multi-Gbps performance on every host. One backend showed ~1.16s TCP connection outliers; its network path warrants separate investigation.
 
-For required pre-merge checks, supported runner environments, branch-protection setup and manual release qualifications, see [CI & Release Qualification Gate](docs/CI_RELEASE_GATE.md).
+For required pre-merge checks, supported runner environments, branch-protection setup and manual release qualifications, see [CI & Release Qualification Gate](docs/CI_RELEASE_GATE.md). For release changes see [CHANGELOG](CHANGELOG.md).
 
 For implementation and compatibility details, see [Native engine technical reference](docs/NATIVE_NFT_CANDIDATE.md).
 
@@ -223,7 +225,7 @@ The migration backs up the current state and detaches only the legacy managed ju
 
 ## Native versus legacy — reference
 
-| | Native nftables v2.0.0-rc3 | Legacy iptables v1.1.0 |
+| Capability | Native nftables v2.1.0 | Legacy iptables v1.1.0 |
 | --- | --- | --- |
 | Command | `portfw-nft` | `portfw` |
 | Installer | `install-native.sh` | `install.sh` |
@@ -231,7 +233,7 @@ The migration backs up the current state and detaches only the legacy managed ju
 | Single ports | Yes | Yes |
 | Port ranges / comma-separated lists | Yes | No |
 | Destination domain (IPv4 A) | Yes | No |
-| Independent DNS timer | Yes (opt-in) | No |
+| DNS scheduler | Automatic when a domain rule is configured; per-rule polling | No |
 | Primary + floating IPv4 | Yes | Yes |
 | Persistent service | `portfw-nft.service` | `iptables-forward-manager.service` |
 

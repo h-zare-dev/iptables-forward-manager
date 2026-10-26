@@ -181,5 +181,64 @@ if ip netns exec "$NSR" nft list table ip ifm_portfw | grep -q 'numgen inc'; the
   echo "RR rules still present after disabling balance" >&2; exit 1
 fi
 ip netns exec "$NSC" python3 "$ROOT/tests/dns_probe.py" probe 198.18.12.2
+# New v2.1.0-rc3 per-rule state: Kernel must use independent policy, not
+# the old domain-level balance file. Operates only in disposable namespaces.
+cat > "$TMP/state/dns-rules.json" <<'JSON'
+{
+  "schema": 1,
+  "rules": {
+    "1": {
+      "mode": "rr",
+      "poll": 1,
+      "rotate": 5,
+      "selected": "198.18.12.2",
+      "backends": ["198.18.12.2", "198.18.12.3"],
+      "last": 0,
+      "checked": 0
+    }
+  }
+}
+JSON
+chmod 600 "$TMP/state/dns-rules.json"
+ip netns exec "$NSR" env PORTFW_STATE_DIR="$TMP/state" PORTFW_LOCK="$TMP/lock" \
+  python3 "$ROOT/portfw-nft" apply
+ip netns exec "$NSC" python3 "$ROOT/tests/dns_probe.py" rr tcp
+ip netns exec "$NSC" python3 "$ROOT/tests/dns_probe.py" rr udp
+
+# New per-rule timed mode on the exact same forwarding entry.
+python3 - "$TMP/state/dns-rules.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+data = json.load(open(path))
+data["rules"]["1"]["mode"] = "timed"
+data["rules"]["1"]["rotate"] = 1
+data["rules"]["1"]["last"] = 0
+data["rules"]["1"]["checked"] = 0
+with open(path, "w") as dest:
+    json.dump(data, dest)
+PY
+ip netns exec "$NSR" env PATH="$TMP/bin:$PATH" PORTFW_TEST_DNS_RECORD="$TMP/dns-record" \
+  PORTFW_STATE_DIR="$TMP/state" PORTFW_LOCK="$TMP/lock" python3 "$ROOT/portfw-nft" dns-refresh
+ip netns exec "$NSC" python3 "$ROOT/tests/dns_probe.py" probe 198.18.12.3
+
+# OFF retains current backend but continues to follow DNS when it disappears.
+python3 - "$TMP/state/dns-rules.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+data = json.load(open(path))
+data["rules"]["1"]["mode"] = "off"
+data["rules"]["1"]["checked"] = 0
+with open(path, "w") as dest:
+    json.dump(data, dest)
+PY
+ip netns exec "$NSR" env PORTFW_STATE_DIR="$TMP/state" PORTFW_LOCK="$TMP/lock" \
+  python3 "$ROOT/portfw-nft" apply
+ip netns exec "$NSC" python3 "$ROOT/tests/dns_probe.py" probe 198.18.12.3
+printf '198.18.12.2\n' > "$TMP/dns-record"
+ip netns exec "$NSR" env PATH="$TMP/bin:$PATH" PORTFW_TEST_DNS_RECORD="$TMP/dns-record" \
+  PORTFW_STATE_DIR="$TMP/state" PORTFW_LOCK="$TMP/lock" python3 "$ROOT/portfw-nft" dns-refresh
+ip netns exec "$NSC" python3 "$ROOT/tests/dns_probe.py" probe 198.18.12.2
+echo "PASS: per-rule DNS mode switch RR/TIMED/OFF and automatic OFF refresh in native kernel."
+
 echo "PASS: per-connection RR two backend distribution, UDP/TCP, DNS changes, OFF restore."
 echo "PASS: real DNS A-record rotation + 5-minute opt-in two-IP backend balancing, unchanged-no-op, failure fallback, TCP delivery and SNAT."

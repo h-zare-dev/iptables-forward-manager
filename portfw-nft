@@ -825,7 +825,10 @@ def refresh_dns():
             policies[rid] = validate_policy(prior)
         new_cache = {k: v for k, v in cache.items() if k in hosts}
         def dataplane(policy):
-            return (policy["mode"], policy["selected"], tuple(policy["backends"]))
+            # OFF and TIMED use only the selected backend in kernel; changes
+            # to unused A records must not disturb live sessions.
+            return (policy["mode"], policy["selected"],
+                    tuple(policy["backends"]) if policy["mode"] == "rr" else ())
         policy_change = any(
             rid in old_policies and dataplane(value) != dataplane(old_policies[rid])
             for rid, value in policies.items()
@@ -1073,6 +1076,25 @@ def list_rules(records):
             ))
     if not rows:
         print(_paint("No forwarding rules configured.", "dim"))
+    if records:
+        policies = read_rule_dns()
+        legacy = read_balance()
+        print(_paint("Traffic distribution / DNS updates:", "cyan"))
+        for rid, _, host, _, _ in records:
+            if not is_domain(host):
+                continue
+            if rid in policies:
+                policy = policies[rid]
+                mode = {"off": "SINGLE IP", "timed": f"TIMED {policy['rotate']}m",
+                        "rr": f"PER-CONNECTION RR x{len(policy['backends'])}"}[policy["mode"]]
+                summary = f"Rule #{rid}: {mode} | DNS every {policy['poll']}m"
+            elif host in legacy:
+                interval = legacy[host][0]
+                mode = f"LEGACY TIMED {interval}m" if interval else "LEGACY RR"
+                summary = f"Rule #{rid}: {mode}"
+            else:
+                summary = f"Rule #{rid}: SINGLE IP | legacy DNS timer"
+            print(_paint("  " + summary, "green"))
     print()
 
 

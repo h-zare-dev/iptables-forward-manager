@@ -367,7 +367,20 @@ def next_rotation(current, addresses, last, interval, now):
 
 
 def configure_balance(rule_id, enable, minutes=5, mode="timed"):
-    """Switch modes for a shared DNS host: off, timed or per-connection RR."""
+    """Legacy CLI entrypoint; edits modern per-rule policy when present."""
+    modern = read_rule_dns().get(rule_id)
+    if modern is not None:
+        row = next((r for r in read_rules() if r[0] == rule_id), None)
+        if row is None:
+            raise PortfwError("Rule ID not found")
+        target_mode = ("rr" if mode == "round-robin" else "timed") if enable else "off"
+        addresses = resolve_all(row[2]) if enable else modern["backends"]
+        # Use same single edit transaction as the interactive menu.
+        change("edit", argparse.Namespace(id=row[0], source=row[1], target=row[2],
+              dest=row[3], protocol=row[4], dns_mode=target_mode,
+              dns_poll=modern["poll"], dns_rotate=minutes,
+              dns_addresses=addresses))
+        return
     if enable and mode not in ("timed", "round-robin"):
         raise PortfwError("Mode must be timed or round-robin")
     if enable and mode == "timed" and minutes not in INTERVALS:
@@ -444,8 +457,17 @@ def configure_balance(rule_id, enable, minutes=5, mode="timed"):
 
 
 def show_balance():
-    config = read_balance()
+    modern = read_rule_dns()
     rules = read_rules()
+    if modern:
+        for rid, _, host, _, _ in rules:
+            if rid not in modern:
+                continue
+            p = modern[rid]
+            print(f"Rule #{rid}: {host} / mode={p['mode'].upper()} / "
+                  f"DNS interval={p['poll']}min / rotation={p['rotate']}min / "
+                  f"selected={p['selected']} / IPs={', '.join(p['backends'])}")
+    config = read_balance()
     all_hosts = sorted({r[2] for r in rules if is_domain(r[2])})
     backends = read_backends()
     cache = read_cache()

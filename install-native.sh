@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Safe side-by-side candidate installer. NEVER enables native NAT automatically.
+# Safe side-by-side native installer. NEVER enables native NAT automatically.
 set -Eeuo pipefail
 [[ $EUID -eq 0 ]] || { echo "Run with sudo/root" >&2; exit 1; }
-REF="${PORTFW_REF:-development}"
+REF="${PORTFW_REF:-main}"
 case "$REF" in
   main|development|feature/*) ;;
   *) echo "Unsupported branch ref: $REF" >&2; exit 1 ;;
@@ -28,7 +28,7 @@ for unit in portfw-nft.service portfw-dns-refresh.service portfw-dns-refresh.tim
   install -m 0644 "$tmp/$unit" "/etc/systemd/system/$unit"
 done
 systemctl daemon-reload
-echo "Native candidate installed SIDE BY SIDE (not activated)."
+echo "Native Port Forward Manager files installed SIDE BY SIDE (not activated)."
 echo "Legacy iptables-forward-manager.service and portfw remain unchanged."
 echo "Inspect: portfw-nft check && portfw-nft render && portfw-migrate preflight"
-echo "Do NOT enable portfw-nft.service before controlled legacy-rule cutover."
+echo "Do NOT enable portfw-nft.service while legacy IFM NAT hooks are active."

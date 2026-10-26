@@ -13,7 +13,7 @@ Every pull request targeting either branch must pass these **stable check names*
 | ShellCheck, actionlint, Python security scanning (Bandit medium/high) | Ubuntu 24.04 | Static defects / workflow correctness / common high-risk Python constructs |
 | Unit and contract tests | Ubuntu 22.04 and 24.04, Debian 12 (bookworm) and 13 (trixie) | Inputs, ranges/lists, collisions, cache/error paths, UI, migration ordering, first-add service logic |
 | Actual Linux Netfilter packet path | Ubuntu 22.04 and 24.04 | Real TCP+UDP packets, positional mapping, DNAT, SNAT, post-reload forwarding in isolated namespaces |
-| DNS A-record rotation | Ubuntu 22.04 and 24.04 | Resolver A-record change, selected IPv4 changes for real TCP, unchanged DNS no-op, failed resolver retains old mapping |
+| DNS A-record rotation and balancing | Ubuntu 22.04 and 24.04 | A-record changes, per-rule OFF/Timed/Per-Connection RR, kernel forwarding for selected backends, no-op updates and resolver-failure retention |
 | Native nftables replace | Ubuntu 22.04 and 24.04 | nftables dry run and single-transaction replacement inside a temporary network namespace |
 | Concurrent CLI writers | Ubuntu 22.04 and 24.04 | Multiple real processes honor flock, don't lose rules; failed simulated apply doesn't corrupt disk |
 | Installer smoke | Disposable Debian 12/13 Docker filesystems | Installation and reinstallation of exact binaries/units, no unintended systemd activation; daemon-reload stubbed |
@@ -43,10 +43,10 @@ GitHub Actions being green without active Required Status Checks **does not prev
 2. Wait until both `quality` and `bash-syntax` are green; inspect failed subjobs and repair before review.
 3. Have the owner merge to `development` (no automated release deployments).
 4. Verify both checks on the resulting `development` commit.
-5. For risky networking, migration, DNS-refresh or systemd changes, perform controlled extra manual tests on a dedicated test server with recent backups and console access; verify real external TCP and UDP.
+5. For risky networking, migration, DNS-refresh or systemd changes, perform controlled extra manual tests on a dedicated test server with recent backups and console access; verify real external connectivity for the protocols actually in use (TCP and/or UDP), without requiring irrelevant protocol tests for a local deployment.
 6. Prepare owner-reviewed PR `development → main`. **The PR must have its own green checks** before owner merge.
 7. Promotion of code does not automatically restart services or change existing kernel firewall state.
 
 For the native upgrade process consult [SAFE_NATIVE_CUTOVER.md](SAFE_NATIVE_CUTOVER.md); for installation and routine commands consult the root [README](../README.md).
 
-**Security note:** A successful CI run is not a guarantee that software has zero vulnerabilities, outages, packet loss or regressions. It is a reproducible set of essential automatic gates plus explicit manual qualification for production network changes.
+**Security note:** A successful CI run is not a guarantee that software has zero vulnerabilities, outages, packet loss, jitter or regressions. It is a reproducible set of essential automatic gates plus explicit manual qualification for production network changes.

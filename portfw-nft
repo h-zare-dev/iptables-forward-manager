@@ -754,17 +754,26 @@ def change(action, args):
 
 
 def refresh_dns():
-    """Poll A records; timed rotates on due time; RR updates backend map on change."""
+    """One shared 1m scheduler: independent per-rule DNS polling and rotation."""
     with locked():
         records = read_rules()
-        hosts = sorted({r[2] for r in records if is_domain(r[2])})
+        old_policies = read_rule_dns()
+        now = int(time.time())
+        due = set()
+        for rid, _, host, _, _ in records:
+            if not is_domain(host):
+                continue
+            policy = old_policies.get(rid)
+            if policy is None or now >= policy["checked"] + policy["poll"] * 60:
+                due.add(host)
+        hosts = {r[2] for r in records if is_domain(r[2])}
     if not hosts:
         print("DNS: no domains configured; no firewall changes")
         return
-    results = {}
-    for host in hosts:
+    answers = {}
+    for host in sorted(due):
         try:
-            results[host] = resolve_all(host)
+            answers[host] = resolve_all(host)
         except PortfwError as exc:
             print(f"DNS warning: {exc}; keeping last known good IP", file=sys.stderr)
     with locked():
@@ -776,35 +785,58 @@ def refresh_dns():
         new_balance = dict(balance)
         old_backends = read_backends()
         backends = dict(old_backends)
+        old_policies = read_rule_dns()
+        policies = {rid: dict(value) for rid, value in old_policies.items()}
         now = int(time.time())
-        for host in hosts:
-            if host not in results:
-                continue
-            addresses = results[host]
-            if host in balance:
-                minutes, selected, last = balance[host]
-                if minutes == 0:  # per-connection RR; no timed selection
-                    backends[host] = addresses
-                    current = cache.get(host, selected)
-                    chosen = current if current in addresses else addresses[0]
-                    cache[host] = chosen
-                    new_balance[host] = (0, chosen, last)
+        legacy_hosts = {r[2] for r in records if is_domain(r[2]) and r[0] not in policies}
+        for host in hosts & answers.keys():
+            addresses = answers[host]
+            if host in legacy_hosts:
+                if host in balance:
+                    minutes, selected, last = balance[host]
+                    if minutes == 0:
+                        backends[host] = addresses
+                        current = cache.get(host, selected)
+                        chosen = current if current in addresses else addresses[0]
+                        cache[host] = chosen
+                        new_balance[host] = (0, chosen, last)
+                    else:
+                        current = cache.get(host, selected)
+                        chosen, next_last = next_rotation(current, addresses, last, minutes, now)
+                        cache[host] = chosen
+                        new_balance[host] = (minutes, chosen, next_last)
                 else:
-                    current = cache.get(host, selected)
-                    chosen, next_last = next_rotation(current, addresses, last, minutes, now)
-                    cache[host] = chosen
-                    new_balance[host] = (minutes, chosen, next_last)
-            else:
-                cache[host] = addresses[0]
-        if any(host not in cache for host in hosts):
-            raise PortfwError("At least one domain has no valid resolved address")
+                    cache[host] = addresses[0]
+        for rid, _, host, _, _ in records:
+            if rid not in policies or not is_domain(host):
+                continue
+            prior = policies[rid]
+            if now >= prior["checked"] + prior["poll"] * 60 and host in answers:
+                prior["backends"] = answers[host]
+                prior["checked"] = now
+            addresses = prior["backends"]
+            if prior["mode"] == "timed":
+                chosen, last = next_rotation(prior["selected"], addresses, prior["last"],
+                                             prior["rotate"], now)
+                prior["selected"] = chosen
+                prior["last"] = last
+            elif prior["selected"] not in addresses:
+                prior["selected"] = addresses[0]
+            policies[rid] = validate_policy(prior)
         new_cache = {k: v for k, v in cache.items() if k in hosts}
-        changed = new_cache != old_cache or backends != old_backends
-        if not changed and new_balance == balance:
+        def dataplane(policy):
+            return (policy["mode"], policy["selected"], tuple(policy["backends"]))
+        policy_change = any(
+            rid in old_policies and dataplane(value) != dataplane(old_policies[rid])
+            for rid, value in policies.items()
+        )
+        changed = new_cache != old_cache or backends != old_backends or policy_change
+        if not changed and policies == old_policies and balance == new_balance:
             print("DNS: unchanged; firewall untouched")
             return
         if changed:
-            apply(records, new_cache, balance=new_balance, backends=backends)
+            apply(records, new_cache, balance=new_balance, backends=backends,
+                  policies=policies)
         try:
             if new_cache != old_cache:
                 save_cache(new_cache)
@@ -812,25 +844,30 @@ def refresh_dns():
                 save_balance(new_balance)
             if backends != old_backends:
                 save_backends(backends)
+            if policies != old_policies:
+                save_rule_dns(policies)
         except OSError as exc:
             try:
                 if changed:
-                    apply(records, old_cache, balance=balance, backends=old_backends)
+                    apply(records, old_cache, balance=balance, backends=old_backends,
+                          policies=old_policies)
                 save_cache(old_cache)
                 save_balance(balance)
                 save_backends(old_backends)
+                save_rule_dns(old_policies)
             except (OSError, PortfwError) as rollback_exc:
-                print(f"CRITICAL: DNS balance rollback failed: {rollback_exc}", file=sys.stderr)
-            raise PortfwError(f"Could not persist DNS cache/balance: {exc}") from exc
+                print(f"CRITICAL: DNS scheduler rollback failed: {rollback_exc}", file=sys.stderr)
+            raise PortfwError(f"Could not persist DNS updates: {exc}") from exc
         if changed:
+            for rid in sorted(policies):
+                if rid in old_policies and dataplane(policies[rid]) != dataplane(old_policies[rid]):
+                    print(f"DNS rule #{rid}: mode={policies[rid]['mode']} -> {policies[rid]['selected']}")
             for host in sorted(hosts):
-                if host in new_balance and new_balance[host][0] == 0 and backends.get(host) != old_backends.get(host):
-                    print(f"DNS per-connection backends updated: {host}: {', '.join(backends[host])}")
-                elif new_cache.get(host) != old_cache.get(host):
+                if host in legacy_hosts and old_cache.get(host) != new_cache.get(host):
                     print(f"DNS target: {host} -> {new_cache[host]}")
             print("DNS: changes applied atomically")
         else:
-            print("DNS: balance state updated; firewall untouched")
+            print("DNS: checked; firewall untouched")
 
 
 def configure_timer(minutes=None, enable=None):

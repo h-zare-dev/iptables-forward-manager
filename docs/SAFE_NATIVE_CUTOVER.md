@@ -2,7 +2,7 @@
 
 ## Status and boundaries
 
-This procedure is **only for an already working legacy installation** on a Debian/Ubuntu host with `iptables -V` showing `(nf_tables)`. It was first exercised on `test-de` with two forwarding entries: TCP+UDP source ports 1015 and 1020. This server has already completed cutover, so **do not run `switch` there a second time**. It does **not** enable domain refresh, edit destinations, or change the database schema.
+This procedure is **only for an already working legacy installation** on a Debian/Ubuntu host with `iptables -V` showing `(nf_tables)`. It was first exercised on `test-de` with two forwarding entries: TCP+UDP source ports 1015 and 1020. This server has already completed cutover, so **do not run `switch` there a second time**. It does **not** configure per-rule DNS balancing or refresh, edit destinations, or change the database schema. Configure automatic DNS updates later using **Edit Forwarding** on the native manager; the installer itself never activates DNS.
 
 **Expect a brief interruption of new TCP/UDP flows during the cutover.** No tool can guarantee packet-loss-free cross-engine migration. Existing conntrack mappings are never flushed, but their targets must remain reachable. Plan a low-traffic maintenance window, have an independent SSH session or provider console available, and test both forwarded ports externally before confirming.
 
@@ -11,10 +11,10 @@ This procedure is **only for an already working legacy installation** on a Debia
 The native installer from `main` installs the migration helper alongside the legacy and native binaries, without activating either engine:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/h-zare-dev/iptables-forward-manager/development/install-native.sh | sudo PORTFW_REF=development bash
+curl -fsSL https://raw.githubusercontent.com/h-zare-dev/iptables-forward-manager/main/install-native.sh | sudo PORTFW_REF=main bash
 ```
 
-For development-only testing, use the intended `feature/*` branch as both the installer URL ref and `PORTFW_REF` value, and verify the exact commit on a non-production host. Current reviewed native release is `v2.0.0-rc3` on `main`.
+For development-only testing, use the intended `feature/*` branch as both the installer URL ref and `PORTFW_REF` value, and verify the exact commit on a non-production host. The current stable native release is `v2.1.0` (after its release PR is merged into `main`).
 
 Check:
 
@@ -46,7 +46,7 @@ The helper:
 
 **On any failure** the helper attempts immediate restoration; the watchdog remains available if recovery fails.
 
-After the switch, use an **external client** to confirm both TCP and UDP connection to `test-de:1015` and `test-de:1020`, all forwarded destinations, and connectivity on any Primary/Floating IP in use. Compare connection errors, packet drops, Jitter, and latency before/after. SSH to the host itself is not a sufficient validation.
+After the switch, use an **external client** to confirm connectivity over each actually configured source port and protocol (TCP and/or UDP) and every intended destination, including any Primary/Floating IP in use. The original `test-de` exercise used source ports 1015/1020; do not assume those are the ports on a different host. Compare connection errors, drop counters, latency and RTT variation before/after. SSH to the host itself is not a sufficient validation.
 
 Only when these end-to-end checks pass, and **within ten minutes**, run:
 
@@ -55,7 +55,7 @@ sudo portfw-migrate confirm
 sudo portfw-migrate status
 ```
 
-Confirmation cancels the rescue timer and persists native as the sole active engine. The DNS refresh timer remains disabled.
+Confirmation cancels the rescue timer and persists native as the sole active engine. The migration helper does not activate DNS refresh; the native Add/Edit flow automatically enables the shared DNS timer when domain rules are configured.
 
 To deliberately revert, even after confirmation, run:
 
@@ -73,7 +73,7 @@ This restores the original `rules.db` and all three old jumps, removes **only** 
 - The existing legacy chains are intentionally left allocated but **detached**; do not reattach them unless rolling back.
 - A local active service and native table do not guarantee end-to-end reachability. The human operator must perform external functional checks before confirmation.
 - Before adding Range/List or Domain rules, verify the plain 1015/1020 legacy equivalents migrated correctly.
-- Domain auto-refresh should only be enabled after testing actual A-record changes and fail-safe behavior.
+- Adding or editing a domain destination in `portfw-nft` automatically manages the DNS timer and per-rule polling; stage a DNS change and failure test before applying such edits to busy production rules.
 - Native nftables avoids rebuilding iptables chains for new config changes, but an engine cutover is not entirely atomic between old and new engines. Do not claim a zero-loss cutover.
 
 ## CI coverage
@@ -82,6 +82,6 @@ This restores the original `rules.db` and all three old jumps, removes **only** 
 
 ## Already migrated to native?
 
-After `confirm`, the native `portfw-nft.service` is enabled and the legacy service is disabled. For routine edits/reload use `sudo portfw-nft`, `sudo portfw-nft list`, and `sudo portfw-nft reload`; **do not run `portfw-migrate switch` again** or use the legacy `portfw --reload` on that host. The root [README](../README.md) is the current operator manual for v2.0.0-rc3.
+After `confirm`, the native `portfw-nft.service` is enabled and the legacy service is disabled. For routine edits/reload use `sudo portfw-nft`, `sudo portfw-nft list`, and `sudo portfw-nft reload`; **do not run `portfw-migrate switch` again** or use the legacy `portfw --reload` on that host. The root [README](../README.md) is the current operator manual for v2.1.0.
 
-A manual `portfw-migrate rollback` restores the rules database **as saved at the original cutover**; any later additions/edits would be lost unless backed up separately. DNS refresh is independent and should remain opt-in pending your A-record change testing.
+A manual `portfw-migrate rollback` restores the rules database **as saved at the original cutover**; any later additions/edits would be lost unless backed up separately. Domain DNS refresh is automatically managed on Add/Edit; it is not turned on merely by installing the binaries. Review automatic DNS behavior separately before editing live domain rules.

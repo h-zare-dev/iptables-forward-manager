@@ -42,7 +42,7 @@ class NativeMenuTests(unittest.TestCase):
             with contextlib.redirect_stdout(result):
                 ui.print_header(self.sample)
         contents = result.getvalue()
-        for term in ("Port Forward Manager", "nftables v2.1.0-rc3",
+        for term in ("Port Forward Manager", "nftables v2.1.0",
                      "Host:", "test-de", "Interface:", "eth0",
                      "Primary IPv4:", "91.107.254.25",
                      "Other IPv4:", "91.98.99.74",

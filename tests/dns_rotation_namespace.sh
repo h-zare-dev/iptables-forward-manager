@@ -181,7 +181,7 @@ if ip netns exec "$NSR" nft list table ip ifm_portfw | grep -q 'numgen inc'; the
   echo "RR rules still present after disabling balance" >&2; exit 1
 fi
 ip netns exec "$NSC" python3 "$ROOT/tests/dns_probe.py" probe 198.18.12.2
-# New v2.1.0-rc3 per-rule state: Kernel must use independent policy, not
+# v2.1.0 per-rule state: Kernel must use independent policy, not
 # the old domain-level balance file. Operates only in disposable namespaces.
 cat > "$TMP/state/dns-rules.json" <<'JSON'
 {

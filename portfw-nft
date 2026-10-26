@@ -16,7 +16,7 @@ import sys
 import tempfile
 import time
 
-VERSION = "2.1.0-rc3"
+VERSION = "2.1.0"
 STATE_DIR = Path(os.environ.get("PORTFW_STATE_DIR", "/etc/iptables-forward-manager"))
 RULES = STATE_DIR / "rules.db"
 CACHE = STATE_DIR / "dns-cache.db"
@@ -1402,7 +1402,7 @@ def interactive():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Native nftables port forwarding (staged opt-in)")
+    parser = argparse.ArgumentParser(description="Native nftables IPv4 port forwarding")
     parser.add_argument("--version", action="version", version=VERSION)
     sub = parser.add_subparsers(dest="action")
     for action in ("add", "edit"):

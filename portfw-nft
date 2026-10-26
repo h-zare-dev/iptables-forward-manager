@@ -1261,34 +1261,38 @@ def _dns_is_enabled():
 
 
 def _dns_settings():
+    """Advanced read-only status and safe repair; no conflicting manual setup."""
     while True:
-        _heading("DNS Auto Refresh", "Separate systemd timer; forwarding remains in kernel", "cyan")
-        interval = _dns_configured_minutes()
-        enabled = _dns_is_enabled()
-        print("Status: " + _paint("Enabled" if enabled else "Disabled", "green" if enabled else "yellow"))
-        print(f"Interval: {_paint(str(interval) + ' minutes', 'cyan')}")
+        _heading("DNS Settings", "Automatic per-rule DNS scheduling", "cyan")
+        policies = read_rule_dns()
+        records = read_rules()
+        print("Scheduler: " + _paint("Active" if _dns_is_enabled() else "Inactive",
+                                     "green" if _dns_is_enabled() else "yellow"))
+        print(_paint("Scheduler tick: 1 minute (managed automatically)", "dim"))
         print()
-        _menu_item("1", "Change Interval", "1/2/3/5/10/15/20/30/45/60 min", "cyan")
-        _menu_item("2", "Enable Timer", "Start periodic DNS checks", "green")
-        _menu_item("3", "Disable Timer", "Keep current forwarding rules", "red")
+        for rid, _, host, _, _ in records:
+            if not is_domain(host):
+                continue
+            policy = policies.get(rid)
+            if policy:
+                label = f"Rule #{rid}: {host} / mode={policy['mode'].upper()} / DNS every {policy['poll']}min"
+            else:
+                label = f"Rule #{rid}: {host} / legacy DNS configuration"
+            print(_paint(label, "cyan"))
+        print()
+        _menu_item("1", "Repair Scheduler", "Ensure DNS polling is enabled for domain rules", "green")
         _menu_item("0", "Back", "Return to main menu", "white")
         choice = _prompt("Select option", color="white")
         if choice == "0":
             return
-        try:
-            if choice == "1":
-                selected = _prompt("Interval in minutes", str(interval), "cyan")
-                if not selected.isdigit() or int(selected) not in INTERVALS:
-                    raise PortfwError(f"Allowed intervals: {', '.join(map(str, INTERVALS))}")
-                configure_timer(int(selected), None)
-            elif choice == "2":
-                configure_timer(None, True)
-            elif choice == "3":
-                configure_timer(None, False)
-            else:
-                print(_paint("Invalid menu option.", "red"))
-        except PortfwError as exc:
-            print(_paint(f"ERROR: {exc}", "red"))
+        if choice == "1":
+            try:
+                _sync_dns_timer(records)
+                print(_paint("✓ DNS scheduler checked.", "green"))
+            except PortfwError as exc:
+                print(_paint(f"ERROR: {exc}", "red"))
+        else:
+            print(_paint("Invalid menu option.", "red"))
 
 
 def _balance_settings():
@@ -1396,9 +1400,8 @@ def interactive():
             _menu_item("4", "List Forwarding", "Show all managed rules", "cyan")
             _menu_item("5", "Delete All", "Remove all managed forwarding rules", "red")
             _menu_item("6", "Reload Rules", "Reapply native maps and re-detect Primary IP", "magenta")
-            _menu_item("7", "DNS Auto Refresh", "Configure background refresh timer", "blue")
+            _menu_item("7", "DNS Settings", "Advanced status / scheduler repair", "blue")
             _menu_item("8", "Refresh DNS Now", "Manually resolve domain destinations", "cyan")
-            _menu_item("9", "DNS Load Balancing", "OFF / Timed Rotation / Per-Connection RR", "green")
             _menu_item("0", "Exit", "Close the manager", "white")
             print()
             choice = _prompt("Select option", color="white")
@@ -1425,11 +1428,9 @@ def interactive():
                 _heading("Refresh DNS Now", "Check configured domains and update only if changed", "cyan")
                 refresh_dns()
                 print(_paint("✓ DNS refresh completed.", "green"))
-            elif choice == "9":
-                _balance_settings()
             else:
                 print(_paint("Invalid menu option.", "red"))
-            if choice not in ("7", "9"):
+            if choice != "7":
                 _pause()
         except (EOFError, KeyboardInterrupt):
             print()
@@ -1477,12 +1478,13 @@ def main():
                 list_rules(records)
             elif args.action == "render":
                 print(nft_config(records, read_cache(), "192.0.2.1", existing=False,
-                                 balance=read_balance(), backends=read_backends()))
+                                 balance=read_balance(), backends=read_backends(), policies=read_rule_dns()))
             elif args.action == "balance":
                 show_balance()
             else:
                 read_balance()
                 read_backends()
+                read_rule_dns()
                 print("State validation OK")
             return
         if os.geteuid() != 0:

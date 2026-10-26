@@ -652,7 +652,29 @@ def _enable_persistence_after_first_add():
               file=sys.stderr)
 
 
+def _sync_dns_timer(records):
+    """One minute scheduler tick; domain rules carry their own 1-60m poll cadence."""
+    has_domains = any(is_domain(r[2]) for r in records)
+    if has_domains:
+        enabled = _dns_is_enabled()
+        if _dns_configured_minutes() != 1:
+            configure_timer(1, None)
+        active = run(["systemctl", "is-active", "portfw-dns-refresh.timer"],
+                     check=False, timeout=5).stdout.strip() == "active"
+        if not enabled or not active:
+            configure_timer(None, True)
+            if not enabled:
+                write_atomic(TIMER_MANAGED, "auto-managed\n")
+        # A timer that was left disabled must not silently remain so.
+        if not _dns_is_enabled():
+            raise PortfwError("DNS timer failed to enable")
+    elif TIMER_MANAGED.exists():
+        configure_timer(None, False)
+        TIMER_MANAGED.unlink()
+
+
 def change(action, args):
+    """Atomic rule + DNS mode transaction with best-effort timer/firewall rollback."""
     first_add = False
     with locked():
         records = read_rules()
@@ -662,16 +684,45 @@ def change(action, args):
         proposed = updated_records(action, args, records)
         old_balance = read_balance()
         old_backends = read_backends()
+        old_policies = read_rule_dns()
+        policies = dict(old_policies)
         new_hosts = {r[2] for r in proposed if is_domain(r[2])}
         next_balance = {k: v for k, v in old_balance.items() if k in new_hosts}
-        next_backends = {k: v for k, v in old_backends.items() if k in next_balance
-                         and next_balance[k][0] == 0}
+        next_backends = {k: v for k, v in old_backends.items()
+                         if k in next_balance and next_balance[k][0] == 0}
         for host in sorted(new_hosts):
             if host not in cache:
                 cache[host] = resolve(host)
         new_cache = {k: v for k, v in cache.items() if k in new_hosts}
-        # Apply the PROPOSED mode, never an old config when a domain was deleted.
-        apply(proposed, new_cache, balance=next_balance, backends=next_backends)
+        active_ids = {r[0] for r in proposed if is_domain(r[2])}
+        policies = {rid: cfg for rid, cfg in policies.items() if rid in active_ids}
+        for rec in proposed:
+            rid, _, host, _, _ = rec
+            if not is_domain(host):
+                continue
+            previous_rule = next((r for r in records if r[0] == rid), None)
+            same_target = previous_rule is not None and previous_rule[2] == host
+            override = action in ("add", "edit") and rid == (
+                proposed[-1][0] if action == "add" else getattr(args, "id", -1)
+            )
+            # Existing upgraded policies are preserved on ordinary edits/CLI.
+            if same_target and rid in policies and not (override and getattr(args, "dns_mode", None)):
+                continue
+            if same_target and rid not in policies and not (override and getattr(args, "dns_mode", None)):
+                continue  # Preserve untouched legacy mode until explicit user edit.
+            if override or not same_target:
+                mode = getattr(args, "dns_mode", "off") or "off"
+                poll = getattr(args, "dns_poll", 5) or 5
+                rotate = getattr(args, "dns_rotate", 5) or 5
+                addresses = getattr(args, "dns_addresses", None)
+                if addresses is None:
+                    addresses = resolve_all(host)
+                previous = policies.get(rid) if same_target else None
+                policies[rid] = create_rule_policy(mode, poll, rotate, addresses,
+                                                   previous=previous)
+        # Validate live nft transaction before any state files are changed.
+        apply(proposed, new_cache, balance=next_balance,
+              backends=next_backends, policies=policies)
         try:
             save_rules(proposed)
             save_cache(new_cache)
@@ -679,16 +730,24 @@ def change(action, args):
                 save_balance(next_balance)
             if next_backends != old_backends:
                 save_backends(next_backends)
-        except OSError as exc:
+            if policies != old_policies:
+                save_rule_dns(policies)
+            # Auto-enable after persistence. Failure is NOT reported as success.
+            if action != "clear" or records:
+                _sync_dns_timer(proposed)
+        except (OSError, PortfwError) as exc:
             try:
-                apply(records, old_cache, balance=old_balance, backends=old_backends)
+                apply(records, old_cache, balance=old_balance,
+                      backends=old_backends, policies=old_policies)
                 save_rules(records)
                 save_cache(old_cache)
                 save_balance(old_balance)
                 save_backends(old_backends)
+                save_rule_dns(old_policies)
+                _sync_dns_timer(records)
             except (OSError, PortfwError) as rollback_exc:
-                print(f"CRITICAL: persistence rollback failed: {rollback_exc}", file=sys.stderr)
-            raise PortfwError(f"Could not persist change: {exc}") from exc
+                print(f"CRITICAL: rollback failed: {rollback_exc}", file=sys.stderr)
+            raise PortfwError(f"Change rejected (DNS timer/state): {exc}") from exc
     if first_add:
         _enable_persistence_after_first_add()
     print(f"{action}: OK")

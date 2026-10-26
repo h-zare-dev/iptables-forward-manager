@@ -898,6 +898,13 @@ def refresh_dns():
 def configure_timer(minutes=None, enable=None):
     if minutes is not None and minutes not in INTERVALS:
         raise PortfwError(f"Interval must be one of {INTERVALS}")
+    if any(is_domain(r[2]) for r in read_rules()):
+        # The scheduler runs every minute; each rule has its own polling cadence.
+        # Blocking manual disable prevents silent stale domain forwarding.
+        if enable is False:
+            raise PortfwError("DNS timer is managed automatically while domain rules exist")
+        if minutes is not None and minutes != 1:
+            raise PortfwError("Scheduler tick is fixed at 1 minute; customize DNS under Edit Forwarding")
     dropin = Path("/etc/systemd/system/portfw-dns-refresh.timer.d/override.conf")
     if minutes is not None:
         write_atomic(dropin, f"[Timer]\nOnUnitInactiveSec=\nOnUnitInactiveSec={minutes}min\nAccuracySec=30s\n")
@@ -1337,100 +1344,6 @@ def _dns_settings():
                 print(_paint(f"ERROR: {exc}", "red"))
         else:
             print(_paint("Invalid menu option.", "red"))
-
-
-def _balance_settings():
-    """Colorful fully keyboard-driven terminal menu (no CLI flags required)."""
-    while True:
-        _heading("DNS Load Balancing", "Choose one of three modes for each DNS destination", "cyan")
-        records = read_rules()
-        config = read_balance()
-        cache = read_cache()
-        backends = read_backends()
-        domains = sorted({r[2] for r in records if is_domain(r[2])})
-        if not domains:
-            print(_paint("  No domain forwarding rules. Add a hostname rule first.", "yellow"))
-        for host in domains:
-            ids = ", ".join(str(r[0]) for r in records if r[2] == host)
-            state = config.get(host)
-            if state is None:
-                mode = "OFF - stable DNS target"
-                color = "white"
-                detail = f"Selected: {cache.get(host, 'N/A')}"
-            elif state[0] == 0:
-                mode = "PER-CONNECTION ROUND ROBIN"
-                color = "green"
-                targets = backends.get(host, [])
-                detail = f"{len(targets)} backend(s): {', '.join(targets)}"
-            else:
-                mode = f"TIMED ROTATION every {state[0]} min"
-                color = "cyan"
-                minutes_left = max(0, (state[0] * 60 - (int(time.time()) - state[2]) + 59) // 60)
-                detail = f"Current: {cache.get(host, 'N/A')} | Next in ~{minutes_left} min"
-            print()
-            _panel_border("┌", "─", "┐")
-            _panel_row("Domain", host)
-            _panel_row("Rule IDs", ids)
-            _panel_row("Mode", mode, color)
-            _panel_row("Info", detail)
-            _panel_border("└", "─", "┘")
-        print()
-        _panel_row("DNS poll timer", ("Enabled" if _dns_is_enabled() else "Disabled")
-                   + f" / {_dns_configured_minutes()} min",
-                   "green" if _dns_is_enabled() else "yellow")
-        print()
-        _menu_item("1", "Configure Rule Mode", "OFF / Timed / Per-Connection", "green")
-        _menu_item("2", "DNS Refresh Timer", "Polling interval and enable/disable", "blue")
-        _menu_item("0", "Back", "Return to main menu", "white")
-        option = _prompt("Select option", color="white")
-        if option == "0":
-            return
-        try:
-            if option == "2":
-                _dns_settings()
-                continue
-            if option != "1":
-                print(_paint("Invalid menu option.", "red"))
-                continue
-            if not domains:
-                raise PortfwError("Create a DNS destination rule first")
-            list_rules([r for r in records if is_domain(r[2])])
-            selected = _prompt("Select Rule ID", color="cyan")
-            if not selected.isdecimal() or not any(r[0] == int(selected) and is_domain(r[2]) for r in records):
-                raise PortfwError("Select a valid domain Rule ID")
-            selected = int(selected)
-            host = next(r[2] for r in records if r[0] == selected)
-            _heading(f"Rule #{selected} - {host}", "Balancing modes", "magenta")
-            _menu_item("1", "OFF (default)", "One selected IP; no balancing", "white")
-            _menu_item("2", "TIMED ROTATION", "Next IP after each time window", "cyan")
-            _menu_item("3", "PER-CONNECTION RR", "Each new connection alternates IP in kernel", "green")
-            _menu_item("0", "Cancel", "No changes", "yellow")
-            mode = _prompt("Choose mode", color="white")
-            if mode == "0":
-                continue
-            if mode not in ("1", "2", "3"):
-                raise PortfwError("Invalid balancing mode")
-            interval = 5
-            if mode == "2":
-                value = _prompt("Rotate after minutes", "5", "cyan")
-                if not value.isdecimal() or int(value) not in INTERVALS:
-                    raise PortfwError(f"Allowed minutes: {', '.join(map(str, INTERVALS))}")
-                interval = int(value)
-            mode_text = ("OFF", f"TIMED every {interval}min", "PER-CONNECTION ROUND ROBIN")[
-                {"1": 0, "2": 1, "3": 2}[mode]]
-            print(_paint(f"Rule #{selected} ({host}): {mode_text}", "yellow"))
-            print(_paint("Existing tracked connections retain their established NAT destination.", "dim"))
-            confirm = _prompt("Apply mode? [y/N]", "N", "yellow")
-            if confirm.lower() not in ("y", "yes"):
-                print(_paint("Cancelled: no changes.", "yellow"))
-                continue
-            configure_balance(selected, mode != "1", interval,
-                              mode="round-robin" if mode == "3" else "timed")
-            print(_paint("✓ Balancing configuration saved.", "green"))
-            _pause()
-        except PortfwError as exc:
-            print(_paint(f"ERROR: {exc}", "red"))
-            _pause()
 
 
 def interactive():
